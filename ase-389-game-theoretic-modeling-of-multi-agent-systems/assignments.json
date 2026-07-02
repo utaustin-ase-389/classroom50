@@ -1,4 +1,24 @@
 {
   "schema": "classroom50/assignments/v1",
-  "assignments": []
+  "assignments": [
+    {
+      "slug": "hello-julia",
+      "name": "Hello Julia",
+      "mode": "individual",
+      "autograder": "default",
+      "feedback_pr": true,
+      "template": {
+        "owner": "utaustin-ase-389",
+        "repo": "Assignment1",
+        "branch": "main"
+      },
+      "due": "2026-09-01T21:59:00Z",
+      "due_meta": {
+        "input": "2026-09-01T23:59:00",
+        "zone": "Europe/Paris",
+        "offset": "+02:00",
+        "source": "auto-detected"
+      }
+    }
+  ]
 }
