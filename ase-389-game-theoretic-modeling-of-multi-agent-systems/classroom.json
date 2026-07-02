@@ -1,0 +1,21 @@
+{
+  "schema": "classroom50/classroom/v1",
+  "name": "ASE 389: Game Theoretic Modeling of Multi-Agent Systems",
+  "short_name": "ase-389-game-theoretic-modeling-of-multi-agent-systems",
+  "term": "Fall 2026",
+  "org": "utaustin-ase-389",
+  "team": {
+    "id": 18298807,
+    "slug": "classroom50-ase-389-game-theoretic-modeling-of-multi-agent-systems"
+  },
+  "teams": {
+    "instructor": {
+      "id": 18298808,
+      "slug": "classroom50-ase-389-game-theoretic-modeling-of-multi-agent-systems-instructor"
+    },
+    "ta": {
+      "id": 18298809,
+      "slug": "classroom50-ase-389-game-theoretic-modeling-of-multi-agent-systems-ta"
+    }
+  }
+}
