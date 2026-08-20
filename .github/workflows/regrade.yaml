@@ -2,7 +2,7 @@ name: Regrade
 
 # Teacher-triggered regrade fan-out. For each targeted student repo it
 # RE-RUNS the repo's latest autograde workflow run (re-fetching the current
-# autograder from Pages), so an existing commit is graded again — e.g. after
+# autograder from Pages), so an existing commit is graded again — e.g., after
 # the teacher fixed a buggy test or changed the autograder. Re-running the
 # same run grades the SAME commit and does NOT create a new submission, so
 # the student's submission time and `late` flag don't change (the runner
@@ -23,7 +23,7 @@ name: Regrade
 # student repo (it can take minutes), so this workflow does NOT collect
 # scores itself — collecting immediately would race the still-running grade
 # jobs. The refreshed releases are ingested by `collect-scores.yaml`
-# (nightly, or "Collect now" from the web app). EVENTUAL CONSISTENCY: until
+# ("Collect now" from the web app, or a manual dispatch). EVENTUAL CONSISTENCY: until
 # that next collect runs, the gradebook still shows the PRE-regrade scores —
 # a "Collect now" fired while grading is still in flight will read the old
 # result.json and only pick up the new score on a later collect. This is
@@ -72,21 +72,22 @@ jobs:
     # just be run again.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
+          python-version: '3.14'
 
       - name: Regrade (re-run student autograde workflows)
         env:
-          # Fine-grained PAT scoped to BOTH `Contents: Read and write` and
-          # `Actions: Read and write` on the <classroom>-* student repos.
-          # Re-running a student repo's latest autograde run (the regrade
-          # path) needs Actions: write; pushing a submit/* tag for a
-          # never-graded repo (the first-grade fallback) needs Contents:
-          # write. Shared with collect-scores.yaml (which only reads
-          # Contents). Rotated via `gh teacher rotate-service-token <org>`.
+          # Fine-grained PAT scoped to `Contents: Read and write`,
+          # `Actions: Read and write` on the <classroom>-* student repos, AND
+          # Organization -> Members: Read. Re-running a student repo's latest
+          # autograde run (the regrade path) needs Actions: write; pushing a
+          # submit/* tag for a never-graded repo (the first-grade fallback)
+          # needs Contents: write; listing the classroom team (regrade is
+          # team-driven, mirroring collect) needs Members: Read. Shared with
+          # collect-scores.yaml. Rotated via `gh teacher rotate-service-token <org>`.
           CLASSROOM50_SERVICE_TOKEN: ${{ secrets.CLASSROOM50_SERVICE_TOKEN }}
           CLASSROOM_FILTER: ${{ github.event.inputs.classroom }}
           ASSIGNMENT_FILTER: ${{ github.event.inputs.assignment }}
