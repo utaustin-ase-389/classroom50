@@ -18,6 +18,10 @@
         "zone": "America/Chicago",
         "offset": "-05:00",
         "source": "auto-detected"
+      },
+      "submission_mode": "tag",
+      "grading": {
+        "mode": "auto"
       }
     }
   ]
