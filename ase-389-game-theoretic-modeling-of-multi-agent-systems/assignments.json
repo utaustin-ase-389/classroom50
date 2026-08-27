@@ -2,7 +2,7 @@
   "schema": "classroom50/assignments/v1",
   "assignments": [
     {
-      "slug": "hello-julia",
+      "slug": "hello",
       "name": "Hello Julia",
       "mode": "individual",
       "autograder": "default",
@@ -22,7 +22,9 @@
       "submission_mode": "tag",
       "grading": {
         "mode": "auto"
-      }
+      },
+      "renamed_from": "hello-julia",
+      "locked": true
     }
   ]
 }
