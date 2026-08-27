@@ -12,17 +12,14 @@
         "repo": "Assignment1",
         "branch": "main"
       },
-      "due": "2026-09-01T04:59:00Z",
+      "due": "2026-09-05T04:59:00Z",
       "due_meta": {
-        "input": "2026-08-31T23:59:00",
+        "input": "2026-09-04T23:59:00",
         "zone": "America/Chicago",
         "offset": "-05:00",
         "source": "auto-detected"
       },
       "submission_mode": "tag",
-      "grading": {
-        "mode": "auto"
-      },
       "renamed_from": "hello-julia"
     }
   ]
