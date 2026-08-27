@@ -23,8 +23,7 @@
       "grading": {
         "mode": "auto"
       },
-      "renamed_from": "hello-julia",
-      "locked": true
+      "renamed_from": "hello-julia"
     }
   ]
 }
