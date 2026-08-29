@@ -22,6 +22,38 @@
       },
       "submission_mode": "tag",
       "renamed_from": "hello-julia"
+    },
+    {
+      "slug": "tag",
+      "name": "Tag",
+      "mode": "individual",
+      "autograder": "default",
+      "feedback_pr": true,
+      "no_autograder": true,
+      "copy_about": true,
+      "copy_topics": true,
+      "template": {
+        "owner": "utaustin-ase-389",
+        "repo": "Assignment2",
+        "branch": "main"
+      },
+      "due": "2026-09-10T04:59:00Z",
+      "due_meta": {
+        "input": "2026-09-09T23:59:00",
+        "zone": "America/Chicago",
+        "offset": "-05:00",
+        "source": "auto-detected"
+      },
+      "available_from": "2026-09-02T15:30:00Z",
+      "available_from_meta": {
+        "input": "2026-09-02T10:30:00",
+        "zone": "America/Chicago",
+        "offset": "-05:00",
+        "source": "auto-detected"
+      },
+      "grading": {
+        "mode": "off"
+      }
     }
   ]
 }
