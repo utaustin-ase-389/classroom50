@@ -2,28 +2,6 @@
   "schema": "classroom50/assignments/v1",
   "assignments": [
     {
-      "slug": "hello",
-      "name": "Hello Julia",
-      "mode": "individual",
-      "autograder": "default",
-      "feedback_pr": true,
-      "no_autograder": true,
-      "template": {
-        "owner": "utaustin-ase-389",
-        "repo": "Assignment1",
-        "branch": "main"
-      },
-      "due": "2026-09-05T04:59:00Z",
-      "due_meta": {
-        "input": "2026-09-04T23:59:00",
-        "zone": "America/Chicago",
-        "offset": "-05:00",
-        "source": "auto-detected"
-      },
-      "submission_mode": "tag",
-      "renamed_from": "hello-julia"
-    },
-    {
       "slug": "tag",
       "name": "Tag",
       "mode": "individual",
@@ -54,6 +32,27 @@
       "grading": {
         "mode": "off"
       }
+    },
+    {
+      "slug": "hello",
+      "name": "Hello Julia",
+      "mode": "individual",
+      "autograder": "default",
+      "feedback_pr": true,
+      "no_autograder": true,
+      "template": {
+        "owner": "utaustin-ase-389",
+        "repo": "Assignment1",
+        "branch": "main"
+      },
+      "due": "2026-09-05T04:59:00Z",
+      "due_meta": {
+        "input": "2026-09-04T23:59:00",
+        "zone": "America/Chicago",
+        "offset": "-05:00",
+        "source": "auto-detected"
+      },
+      "renamed_from": "hello-julia"
     }
   ]
 }
