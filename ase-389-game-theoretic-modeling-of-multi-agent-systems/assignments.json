@@ -53,6 +53,39 @@
         "source": "auto-detected"
       },
       "renamed_from": "hello-julia"
+    },
+    {
+      "slug": "mcts",
+      "name": "Tic-tac-toe",
+      "mode": "individual",
+      "autograder": "default",
+      "feedback_pr": true,
+      "no_autograder": true,
+      "copy_about": true,
+      "copy_topics": true,
+      "template": {
+        "owner": "utaustin-ase-389",
+        "repo": "Assignment3",
+        "branch": "main"
+      },
+      "due": "2026-10-01T04:59:00Z",
+      "due_meta": {
+        "input": "2026-09-30T23:59:00",
+        "zone": "America/Chicago",
+        "offset": "-05:00",
+        "source": "auto-detected"
+      },
+      "available_from": "2026-09-10T15:02:00Z",
+      "available_from_meta": {
+        "input": "2026-09-10T10:02:00",
+        "zone": "America/Chicago",
+        "offset": "-05:00",
+        "source": "auto-detected"
+      },
+      "locked": true,
+      "grading": {
+        "mode": "off"
+      }
     }
   ]
 }
