@@ -85,6 +85,31 @@
       "grading": {
         "mode": "off"
       }
+    },
+    {
+      "slug": "lq",
+      "name": "LQ games",
+      "mode": "individual",
+      "autograder": "default",
+      "feedback_pr": true,
+      "no_autograder": true,
+      "copy_about": true,
+      "copy_topics": true,
+      "template": {
+        "owner": "utaustin-ase-389",
+        "repo": "Assignment4",
+        "branch": "main"
+      },
+      "due": "2026-10-27T04:59:00Z",
+      "due_meta": {
+        "input": "2026-10-26T23:59:00",
+        "zone": "America/Chicago",
+        "offset": "-05:00",
+        "source": "auto-detected"
+      },
+      "grading": {
+        "mode": "off"
+      }
     }
   ]
 }
