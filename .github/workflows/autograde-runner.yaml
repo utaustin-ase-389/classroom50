@@ -2,7 +2,7 @@ name: Classroom50 Autograde Runner
 
 # Reusable workflow called by every student-repo autograde shim.
 # For per-assignment runtime config (Python version, apt packages,
-# container image), edit assignments.json — see the Autograders
+# container image), edit assignments.json. See the Autograders
 # wiki page. Edit this file only when you need to add a language
 # toolchain GitHub doesn't ship a setup-* action for, swap the
 # runner-side bootstrap, or change post-grade behavior.
@@ -21,14 +21,11 @@ permissions:
   contents: write
   statuses: write
   # pull-requests: write powers the opt-in Feedback PR. The
-  # calling shim must grant the same scope — a reusable workflow's
+  # calling shim must grant the same scope: a reusable workflow's
   # effective token is the intersection with the caller's permissions.
   pull-requests: write
 
-# cancel-in-progress: false — every push gets its own release.
-# The set-latest job (further down) serializes the latest-pointer
-# flip so out-of-order completions can't make older submissions
-# look latest.
+# cancel-in-progress: false, so every push gets its own release.
 concurrency:
   group: classroom50-autograde-${{ github.ref }}
   cancel-in-progress: false
@@ -50,7 +47,7 @@ jobs:
       branch-push-suppressed: ${{ steps.read.outputs.branch-push-suppressed }}
       # 'true' -> a pushed tag matched neither submit/* nor any configured
       # submission_tags pattern (stale/hand-edited shim); skip tagging +
-      # grading — the tag is not a submission trigger.
+      # grading: the tag is not a submission trigger.
       foreign-tag-suppressed: ${{ steps.read.outputs.foreign-tag-suppressed }}
       # The teacher-named milestone tag that triggered this run ('' for a
       # branch or canonical submit/* trigger); surfaces in the Release title.
@@ -64,6 +61,8 @@ jobs:
       go:             ${{ steps.read.outputs.go }}
       rust:           ${{ steps.read.outputs.rust }}
       apt:            ${{ steps.read.outputs.apt }}
+      # "--no-install-recommends" (the default) or "" (runtime.apt-recommends).
+      apt-install-flags: ${{ steps.read.outputs.apt-install-flags }}
       base-url:       ${{ steps.read.outputs.base-url }}
       classroom:      ${{ steps.read.outputs.classroom }}
       assignment:     ${{ steps.read.outputs.assignment }}
@@ -71,7 +70,7 @@ jobs:
       feedback-pr:    ${{ steps.read.outputs.feedback-pr }}
       # Feedback-PR-body template opt-in (feedback_pr_template) + the template
       # ref, so the Ensure-Feedback-PR fallback creator can honor the assignment
-      # setting (best-effort — the Actions token may not read a private template).
+      # setting (best-effort: the Actions token may not read a private template).
       feedback-pr-template: ${{ steps.read.outputs.feedback-pr-template }}
       template-repo:  ${{ steps.read.outputs.template-repo }}
       template-branch: ${{ steps.read.outputs.template-branch }}
@@ -79,8 +78,9 @@ jobs:
       allowed-files:  ${{ steps.read.outputs.allowed-files }}
       release-assets: ${{ steps.read.outputs.release-assets }}
       # 'true' -> no autograder configured (no declarative tests, no
-      # per-assignment bundle, no classroom-default autograder.py), so grade +
-      # set-latest skip. Fails OPEN: any probe error emits 'false' and grades.
+      # per-assignment bundle, no classroom-default autograder.py), so grade
+      # skips the toolchain installs. Fails OPEN: any probe error emits 'false'
+      # and grades.
       no-autograder:  ${{ steps.read.outputs.no-autograder }}
     steps:
       - name: Check out repository
@@ -99,7 +99,7 @@ jobs:
 
       # === Skip the acceptance commit / a shim-retrofit commit ===
       # The accept commit (adds .classroom50.yaml + the shim, student-
-      # authored, so it fires this workflow) has nothing to grade — and
+      # authored, so it fires this workflow) has nothing to grade, and
       # neither does a teacher-side submission-mode shim retrofit (touches
       # only .github/workflows/autograde.yaml; its [skip ci] normally keeps
       # this workflow from running at all, this is the backstop). Detect
@@ -152,11 +152,11 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
             -f state="success" \
             -f context="classroom50/autograde" \
-            -f description="acceptance commit — nothing to grade yet; run gh student submit" \
+            -f description="acceptance commit: nothing to grade yet; run gh student submit" \
             -f target_url="$RUN_URL" >/dev/null 2>&1 || true
 
       # === Read metadata + validate runtime ===
-      # `.classroom50.yaml` is in the student repo (untrusted) — every
+      # `.classroom50.yaml` is in the student repo (untrusted): every
       # field validated against a strict regex; org pinned to the
       # calling repo's owner so a hand-edited file can't redirect to
       # an attacker-hosted Pages site. Allow-lists mirror
@@ -200,13 +200,13 @@ jobs:
               with open(".classroom50.yaml") as fh:
                   cfg = yaml.safe_load(fh) or {}
           except FileNotFoundError:
-              fail(".classroom50.yaml not found — was this repo created by `gh student accept`?")
+              fail(".classroom50.yaml not found. Was this repo created by `gh student accept`?")
           except yaml.YAMLError as exc:
               fail(f".classroom50.yaml is malformed YAML: {exc}")
 
           def safe(value, label, pattern):
               if not isinstance(value, str) or not pattern.match(value):
-                  fail(f".classroom50.yaml field {label!r} has invalid value {value!r} (must match {pattern.pattern!r}) — re-run `gh student accept`")
+                  fail(f".classroom50.yaml field {label!r} has invalid value {value!r} (must match {pattern.pattern!r}). Re-run `gh student accept`")
               return value
 
           classroom  = safe((cfg.get("classroom") or "").strip(),  "classroom",  _SLUG)
@@ -217,7 +217,7 @@ jobs:
           # same strict regex as the other fields since it composes into a URL.
           secret = (cfg.get("secret") or "").strip()
           if secret and not _SECRET.match(secret):
-              fail(f".classroom50.yaml field 'secret' has invalid value {secret!r} (must match {_SECRET.pattern!r}) — re-run `gh student accept`")
+              fail(f".classroom50.yaml field 'secret' has invalid value {secret!r} (must match {_SECRET.pattern!r}). Re-run `gh student accept`")
 
           owner = os.environ["REPO_OWNER"]
           base_url = f"https://{owner}.github.io/classroom50"
@@ -249,9 +249,9 @@ jobs:
               with get(manifest_url) as resp:
                   manifest = json.load(resp)
           except urllib.error.HTTPError as exc:
-              fail(f"GET {manifest_url}: HTTP {exc.code} — ask your teacher to confirm publish-pages.yaml has run")
+              fail(f"GET {manifest_url}: HTTP {exc.code}. Ask your teacher to confirm publish-pages.yaml has run")
           except urllib.error.URLError as exc:
-              fail(f"GET {manifest_url}: {exc.reason} — the Pages site may not be deployed yet")
+              fail(f"GET {manifest_url}: {exc.reason}. The Pages site may not be deployed yet")
 
           if not isinstance(manifest, dict) or manifest.get("schema") != "classroom50/assignments/v1":
               fail(f"{manifest_url}: schema = {manifest.get('schema')!r}, want 'classroom50/assignments/v1'")
@@ -261,32 +261,32 @@ jobs:
               None,
           )
           if entry is None:
-              fail(f"assignment {assignment!r} not registered in {manifest_url} — ask your teacher to run `gh teacher assignment add`")
+              fail(f"assignment {assignment!r} not registered in {manifest_url}. Ask your teacher to run `gh teacher assignment add`")
 
-          # empty_repo assignments never autograde — same predicate as
+          # empty_repo assignments never autograde. Same predicate as
           # collect_scores.py / regrade_repos.py (is_empty_repo: strictly the
           # boolean true, matching Go's bool decode and TS's === true),
           # enforced here too because student repos are student-writable: a
           # hand-added workflow calling this runner must not re-enter the
           # grading pipeline (releases, submit tags) that collection skips.
           if entry.get("empty_repo") is True:
-              fail(f"assignment {assignment!r} is an empty-repository assignment — autograding is disabled for it")
+              fail(f"assignment {assignment!r} is an empty-repository assignment: autograding is disabled for it")
 
-          # no_autograder assignments (templated, teacher-supplied CI) commit no
+          # no_autograder assignments (no built-in autograder) commit no
           # shim, so the runner should never be invoked for one. Enforced here
           # for the same student-writable reason as empty_repo: a hand-added
           # workflow must not re-enter the grading pipeline collection skips.
           # Strict boolean, byte-identical to is_no_autograder in
           # collect_scores.py / regrade_repos.py.
           if entry.get("no_autograder") is True:
-              fail(f"assignment {assignment!r} is a no-autograder assignment (teacher-supplied CI) — built-in autograding is disabled for it")
+              fail(f"assignment {assignment!r} is a no-autograder assignment: built-in autograding is disabled for it")
 
           # === Re-validate the declarative tests block ===
           # Mirrors cli/gh-teacher/tests.go (write-time validator) so a
           # hand-edited assignments.json fails here with a clear
           # setup-time error instead of mid-grade. The specs never touch
-          # workflow YAML — they reach the grade job as Pages-bundle
-          # data — and nothing from `tests` is emitted to job outputs.
+          # workflow YAML (they reach the grade job as Pages-bundle
+          # data) and nothing from `tests` is emitted to job outputs.
           tests = entry.get("tests")
           if tests is not None:
               _TEST_TYPES = {"io", "run", "python"}
@@ -294,7 +294,8 @@ jobs:
               _FAILURE_DETAILS = {"full", "actual-only", "none"}
               _TEST_KEYS = {"name", "type", "setup", "run", "input", "input-file",
                             "expected", "expected-file", "comparison", "timeout",
-                            "exit-code", "points", "failure-details", "show-output"}
+                            "exit-code", "points", "failure-details", "show-output",
+                            "show-command"}
               _IO_ONLY_KEYS = ("input", "input-file", "expected", "expected-file", "comparison")
               if not isinstance(tests, list):
                   fail(f"entry {assignment!r}: tests must be an array")
@@ -340,6 +341,9 @@ jobs:
                   so = t.get("show-output")
                   if so is not None and not isinstance(so, bool):
                       fail(f"{where}.show-output must be a boolean")
+                  sc = t.get("show-command")
+                  if sc is not None and not isinstance(sc, bool):
+                      fail(f"{where}.show-command must be a boolean")
                   exit_code = t.get("exit-code")
                   if ttype == "io":
                       comparison = t.get("comparison")
@@ -370,7 +374,7 @@ jobs:
           if test_defaults is not None:
               if not isinstance(test_defaults, dict):
                   fail(f"entry {assignment!r}: test_defaults must be an object")
-              extras = sorted(set(test_defaults) - {"failure-details", "show-output"})
+              extras = sorted(set(test_defaults) - {"failure-details", "show-output", "show-command"})
               if extras:
                   fail(f"entry {assignment!r}: test_defaults has unsupported keys: {extras}")
               fd = test_defaults.get("failure-details")
@@ -379,6 +383,9 @@ jobs:
               so = test_defaults.get("show-output")
               if so is not None and not isinstance(so, bool):
                   fail(f"entry {assignment!r}: test_defaults.show-output must be a boolean")
+              sc = test_defaults.get("show-command")
+              if sc is not None and not isinstance(sc, bool):
+                  fail(f"entry {assignment!r}: test_defaults.show-command must be a boolean")
 
           runtime = entry.get("runtime") or {}
           if not isinstance(runtime, dict):
@@ -388,7 +395,7 @@ jobs:
           # A hand-edited assignments.json with extra keys (e.g., an
           # `options:` smuggled at runtime level) would otherwise pass
           # this validator silently while the CLI rejects it at write.
-          _RUNTIME_KEYS = {"runs-on", "container", "python", "node", "java", "go", "rust", "apt"}
+          _RUNTIME_KEYS = {"runs-on", "container", "python", "node", "java", "go", "rust", "apt", "apt-recommends"}
           extras = set(runtime) - _RUNTIME_KEYS
           if extras:
               fail(f"runtime has unsupported keys: {sorted(extras)}")
@@ -401,10 +408,11 @@ jobs:
           go        = runtime.get("go")       or ""
           rust      = runtime.get("rust")     or ""
           apt       = runtime.get("apt")      or []
+          apt_recommends = runtime.get("apt-recommends")
 
           # runs-on mirrors GitHub Actions: a single label or an array
           # (["self-hosted", "gpu"]), normalized to a list. No value
-          # allow-list (mirror Go's ValidateRunsOn) — only injection-
+          # allow-list (mirror Go's ValidateRunsOn), only injection-
           # checked. The degenerate "" and [] forms are rejected (mirror
           # Go's UnmarshalJSON + the schema) so only an OMITTED runs-on
           # means "use the default".
@@ -429,7 +437,7 @@ jobs:
           if container is not None:
               if not isinstance(container, dict):
                   fail("runtime.container must be an object")
-              # Same allow-list discipline at the container level —
+              # Same allow-list discipline at the container level:
               # closes the "smuggle --privileged via container.options"
               # vector. Mirror Go's containerSpec exactly. Only `image`
               # and `user` are accepted; private registries can't be
@@ -446,7 +454,9 @@ jobs:
                   fail(f"runtime.container.image {image!r} must match {_IMAGE.pattern}")
               if apt:
                   fail("runtime.apt is not allowed when runtime.container is set")
-              # Containers run on Ubuntu only — reject a recognized
+              if apt_recommends is not None:
+                  fail("runtime.apt-recommends is not allowed when runtime.container is set")
+              # Containers run on Ubuntu only: reject a recognized
               # macOS/Windows label; custom/self-hosted labels pass
               # (the teacher owns OS matching). Mirrors Go's
               # isNonUbuntuHostedLabel.
@@ -462,7 +472,7 @@ jobs:
               user = container.get("user")
               if user is not None and (not isinstance(user, str) or not _USER.match(user)):
                   fail(f"runtime.container.user {user!r} must match {_USER.pattern}")
-              # Build `emitted` from validated fields only — prevents
+              # Build `emitted` from validated fields only, which prevents
               # any future schema-skew (e.g., a new GHA container key
               # added by Actions) from flowing through unchecked.
               emitted = {"image": image}
@@ -477,7 +487,7 @@ jobs:
               container_json = "null"
               # Default the host path to a recent Python so teachers
               # don't need to set it explicitly for every assignment.
-              # Container path leaves python alone — the image owns
+              # Container path leaves python alone: the image owns
               # the toolchain. (runner.py itself works on any 3.x
               # via the legacy tar-extraction fallback.)
               if not python:
@@ -498,6 +508,17 @@ jobs:
               if not isinstance(pkg, str) or not _APT.match(pkg):
                   fail(f"runtime.apt[{i}] {pkg!r} must match {_APT.pattern}")
           apt_str = " ".join(apt)
+          # Recommended packages are skipped by default (smaller, faster
+          # install); apt-recommends: true restores apt-get's own default so
+          # a stack like pandoc + texlive gets the pieces it pulls in locally
+          # (#815). The flag string is built from this fixed choice, never
+          # from the file, so nothing else can reach the apt-get line.
+          if apt_recommends is not None:
+              if not isinstance(apt_recommends, bool):
+                  fail("runtime.apt-recommends must be a boolean")
+              if not apt:
+                  fail("runtime.apt-recommends requires runtime.apt")
+          apt_install_flags = "" if apt_recommends else "--no-install-recommends"
 
           # === Feedback PR opt-in ===
           # Mirror Go's bool `feedback_pr` field. Re-validated here (like
@@ -605,12 +626,12 @@ jobs:
           # === Submission mode ===
           # Mirror Go's ValidateSubmissionMode: absent/empty means every-push;
           # a non-empty value must be one of the enum (contract.SubmissionModes,
-          # by-value copy — keep in lockstep). In tag mode a BRANCH-triggered
+          # by-value copy; keep in lockstep). In tag mode a BRANCH-triggered
           # run is suppressed (no tag, no grade): the shim shouldn't have fired
           # at all, so this only happens with a stale every-push shim (mode
           # changed, retrofit pending/failed) or a hand-edited one. Suppressing
-          # here keeps a plain `git push` from grading — the cost lever the
-          # mode exists for — while a submission-tag push always grades.
+          # here keeps a plain `git push` from grading (the cost lever the
+          # mode exists for) while a submission-tag push always grades.
           submission_mode = entry.get("submission_mode") or "every-push"
           if submission_mode not in ("every-push", "tag"):
               fail(f"entry {assignment!r}: submission_mode {submission_mode!r} must be 'every-push' or 'tag'")
@@ -628,21 +649,21 @@ jobs:
           #                            submission; the trigger tag is only the
           #                            trigger)
           #   - matches nothing     -> not a submission trigger; suppress
-          #                            gracefully (stale/hand-edited shim —
+          #                            gracefully (stale/hand-edited shim;
           #                            same defense-in-depth rationale as the
           #                            stale-shim branch suppression; the shim
           #                            normally pre-filters via on.push.tags)
           # matches_submission_tag is a by-value copy of Go's
           # contract.MatchesSubmissionTag / the web matchesSubmissionTag,
           # pinned to identical output by the shared golden fixture
-          # cli/shared/testdata/submission_tag_match_cases.json — keep in
+          # cli/shared/testdata/submission_tag_match_cases.json; keep in
           # lockstep.
           submission_tags = entry.get("submission_tags") or []
           if not isinstance(submission_tags, list):
               fail(f"entry {assignment!r}: submission_tags must be an array")
           _TAG_PATTERN = re.compile(r"^[A-Za-z0-9._/*?+\[\]-]+$")
           # Stacked/leading quantifiers (`v*+`, `+lead`) compile as POSSESSIVE
-          # quantifiers in Python but are compile errors in Go/JS — the one
+          # quantifiers in Python but are compile errors in Go/JS: the one
           # construct where the four matcher copies would diverge, so reject
           # like the write-side validators (contract.stackedQuantifierRE).
           _STACKED_QUANTIFIER = re.compile(r"^[?+]|[*?+]\+")
@@ -703,18 +724,18 @@ jobs:
                   foreign_tag_suppressed = True
 
           # === No-autograder detection ===
-          # Skip grade + set-latest when nothing is configured to grade,
+          # Skip the toolchain installs when nothing is configured to grade,
           # inverting resolve_entrypoint's fall-through: no declarative tests
           # AND no per-assignment bundle AND no classroom-default autograder.py.
           # runner.py's no_autograder() stays the fail-open backstop. FAIL OPEN
-          # here too — a probe that can't prove absence must grade — so any
+          # here too (a probe that can't prove absence must grade), so any
           # non-404 / network error falls open to grading.
           # The bundle + classroom-default URL shapes mirror runner.py's
           # bundle_url / classroom_default_autograder_url (pinned by
           # contract_test.go); segment left un-quoted to match classroom_segment
           # (both parts are regex-validated upstream).
           # Non-retrying: the outcome is only ever acted on for a confirmed 404,
-          # so a transient 5xx falls open to grading anyway — no point spending
+          # so a transient 5xx falls open to grading anyway; no point spending
           # get()'s retry ladder on a result we'd discard.
           def probe_absent(url):
               try:
@@ -751,6 +772,7 @@ jobs:
           emit("go", go)
           emit("rust", rust)
           emit("apt", apt_str)
+          emit("apt-install-flags", apt_install_flags)
           emit("base-url", base_url)
           emit("classroom", classroom)
           emit("assignment", assignment)
@@ -768,8 +790,8 @@ jobs:
       # Branch trigger: create submit/<UTC-timestamp>-<short-sha> at
       # the pushed SHA. Canonical submit/* tag trigger: reuse the pushed
       # tag. Milestone-tag trigger (a teacher-named submission_tags
-      # pattern): mint/reuse the canonical tag exactly like a branch run —
-      # the milestone tag TRIGGERS grading but the immutable submit/* tag
+      # pattern): mint/reuse the canonical tag exactly like a branch run.
+      # The milestone tag TRIGGERS grading but the immutable submit/* tag
       # IS the record (a reusable tag like `phase1` moves between commits;
       # parking the release on it would overwrite prior submissions).
       # Tags pushed with github.token don't fire workflows
@@ -791,11 +813,11 @@ jobs:
           TRIGGER_TAG: ${{ steps.read.outputs.trigger-tag }}
         run: |
           set -euo pipefail
-          # A canonical submit/* tag push IS the record — reuse it verbatim.
+          # A canonical submit/* tag push IS the record: reuse it verbatim.
           # A milestone-tag push (TRIGGER_TAG set) falls through to the
           # mint/reuse path below, same as a branch push. Any other tag
           # was suppressed by the read step (foreign-tag-suppressed), so
-          # reaching here with one is a wiring bug — fail loudly.
+          # reaching here with one is a wiring bug: fail loudly.
           if [[ "$REF" == refs/tags/* && -z "$TRIGGER_TAG" ]]; then
             if [[ "$REF_NAME" != submit/* ]]; then
               echo "::error::tag $REF_NAME reached the tag step without matching submit/* or a submission pattern" >&2
@@ -808,8 +830,8 @@ jobs:
           # (workflow re-run of the same commit, a submit client that
           # already tagged it, or a re-pushed milestone tag), reuse it
           # instead of racing on a fresh timestamp. `--refs` filters out
-          # the `refs/tags/X^{}` peeled-ref rows that annotated tags emit
-          # — without it, awk could capture e.g., `submit/foo^{}` and
+          # the `refs/tags/X^{}` peeled-ref rows that annotated tags emit.
+          # Without it, awk could capture e.g., `submit/foo^{}` and
           # produce an invalid pseudo-tag.
           EXISTING=$(git ls-remote --refs --tags origin \
                        | awk -v sha="$SHA" '$1 == sha && $2 ~ /^refs\/tags\/submit\// { sub("refs/tags/", "", $2); print $2; exit }')
@@ -828,14 +850,14 @@ jobs:
 
       # === Foreign-tag commit status ===
       # A pushed tag matched neither submit/* nor any configured
-      # submission_tags pattern (stale/hand-edited shim — the on.push.tags
+      # submission_tags pattern (stale/hand-edited shim; the on.push.tags
       # filter normally pre-empts this run entirely). Nothing tags or
       # grades; say why. DISTINCT CONTEXT (classroom50/autograde-skipped),
       # unlike the nothing-to-grade skips above: here the student's real
       # work exists but was NOT graded, and a green classroom50/autograde
       # would read as "graded successfully" to both humans and any client
-      # polling that context. The main context stays absent — accurate,
-      # since no grade will ever appear for this commit. Best-effort;
+      # polling that context. The main context stays absent, which is
+      # accurate, since no grade will ever appear for this commit. Best-effort;
       # never fails the job.
       - name: Foreign-tag commit status
         if: steps.read.outputs.foreign-tag-suppressed == 'true'
@@ -847,7 +869,7 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
             -f state="success" \
             -f context="classroom50/autograde-skipped" \
-            -f description="tag is not a submission trigger — not graded" \
+            -f description="tag is not a submission trigger, so this commit was not graded" \
             -f target_url="$RUN_URL" >/dev/null 2>&1 || true
 
       # === Suppressed-push commit status ===
@@ -868,7 +890,7 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
             -f state="success" \
             -f context="classroom50/autograde-skipped" \
-            -f description="tag-mode assignment — push not graded; run gh student submit" \
+            -f description="tag-mode assignment: push not graded; run gh student submit" \
             -f target_url="$RUN_URL" >/dev/null 2>&1 || true
 
       # === Shim-update commit status ===
@@ -885,14 +907,14 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
             -f state="success" \
             -f context="classroom50/autograde" \
-            -f description="autograder trigger updated — nothing to grade" \
+            -f description="autograder trigger updated: nothing to grade" \
             -f target_url="$RUN_URL" >/dev/null 2>&1 || true
 
   grade:
     needs: setup
     # Skip the acceptance commit, a shim-retrofit commit, a suppressed
-    # tag-mode branch push, and a suppressed foreign tag (set-latest needs
-    # grade, so it skips too). The no-autograder case still runs so the
+    # tag-mode branch push, and a suppressed foreign tag. The no-autograder
+    # case still runs so the
     # submission is RECORDED: runner.py synthesizes a vacuous-pass (0/0
     # success) result and the Release step publishes it, keeping the
     # submission visible on the teacher dashboard (which reads submit/*
@@ -908,8 +930,8 @@ jobs:
     container: ${{ fromJSON(needs.setup.outputs.container) }}
     timeout-minutes: 15
     # Pin bash explicitly. GitHub-hosted runners default run: steps
-    # to bash, but inside a container Actions falls back to `sh -e`
-    # — and our run: blocks use `set -euo pipefail` (bash-only).
+    # to bash, but inside a container Actions falls back to `sh -e`,
+    # and our run: blocks use `set -euo pipefail` (bash-only).
     defaults:
       run:
         shell: bash
@@ -952,13 +974,13 @@ jobs:
       # self-hosted runner supplies its own prebuilt toolchains (and their
       # dependencies), so layering setup-* / apt on top would shadow the
       # runner's environment and break autograders that import preinstalled
-      # packages (see issue #369). Keyed on the runner itself — not the
-      # `runs-on` label — so it also covers self-hosted runners registered
+      # packages (see issue #369). Keyed on the runner itself (not the
+      # `runs-on` label) so it also covers self-hosted runners registered
       # with --no-default-labels or selected by a runner group.
       #
       # Also gated off no-autograder: when nothing is configured to grade, the
       # job still runs to RECORD the submission (runner.py's vacuous-pass), but
-      # it needs only system python3 — so skip every toolchain install and spend
+      # it needs only system python3, so skip every toolchain install and spend
       # no minutes provisioning a toolchain the recording path won't use.
       - name: Set up Python
         if: needs.setup.outputs.python != '' && needs.setup.outputs.no-autograder != 'true' && runner.environment != 'self-hosted'
@@ -999,7 +1021,27 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ${{ needs.setup.outputs.apt }}
+          sudo apt-get install -y ${{ needs.setup.outputs.apt-install-flags }} ${{ needs.setup.outputs.apt }}
+
+      # Fail early with a clear message instead of `gh: command not found`
+      # after grading (issue #863). Placed after the toolchain steps so a
+      # setup-python-provided python3 counts. Only tools whose absence already
+      # fails the job are fatal; runner.py degrades on purpose without git.
+      - name: Check runner tools
+        run: |
+          set -euo pipefail
+          WIKI="https://github.com/foundation50/classroom50/wiki/Advanced-Autograding#the-runtime-block"
+          MISSING=()
+          for TOOL in curl python3 gh; do
+            command -v "$TOOL" >/dev/null 2>&1 || MISSING+=("$TOOL")
+          done
+          if (( ${#MISSING[@]} > 0 )); then
+            echo "::error::This runner is missing tools the grade job needs: ${MISSING[*]}. Install them on the self-hosted runner or in the container image, then re-run. See $WIKI"
+            exit 1
+          fi
+          if ! command -v git >/dev/null 2>&1; then
+            echo "::warning::git is not installed on this runner. Grading continues, but allowed_files is not enforced, the review diff link is missing, and submission timestamps fall back to the grading time. Install git to restore them. See $WIKI"
+          fi
 
       # === Run runner.py (which execs the autograder) ===
       # runner.py is fetched fresh every run so updates to the
@@ -1008,7 +1050,7 @@ jobs:
       # `--retry-all-errors` covers DNS / TLS / 5xx / partial response;
       # `--retry-delay 2` uses a fixed 2s gap (it disables curl's
       # exponential backoff), so 3 retries add ~6s plus the 30s
-      # per-attempt ceiling — well under the grade job's 15-minute timeout.
+      # per-attempt ceiling, well under the grade job's 15-minute timeout.
       - name: Grade details
         id: autograde
         run: |
@@ -1046,9 +1088,15 @@ jobs:
             -f target_url="$RUN_URL"
 
       # === Publish submit-tag release ===
-      # Created with --latest=false; the set-latest job below owns
-      # the latest-pointer flip (serialized to avoid races between
-      # concurrent grade jobs). Idempotent on workflow re-runs.
+      # Created with --latest=true: latest = the most recent SUBMISSION
+      # EVENT, not the newest commit. Every published submission claims
+      # the badge, so grading an older commit on purpose (a milestone tag
+      # like phase1 re-pointed at earlier work, or a teacher regrade)
+      # makes THAT release latest. This matches the gradebook collector
+      # and the web submission views, which both order by release publish
+      # time: one definition everywhere. Claiming it at creation (GitHub's
+      # own default) instead of in a follow-up job saves a billable
+      # runner-minute per submission (#1019). Idempotent on workflow re-runs.
       - name: Publish submission release
         if: success() && steps.autograde.outputs.status != 'error'
         env:
@@ -1073,7 +1121,7 @@ jobs:
           # Collect the valid staged extras FIRST, so they're attached in the
           # same `gh release create` as result.json. Immutable releases (an org
           # ruleset can enforce them) reject a later `gh release upload`/`edit`
-          # with HTTP 422, so assets must be baked in at creation time — a
+          # with HTTP 422, so assets must be baked in at creation time; a
           # post-create upload can never succeed there. Re-validate each staged
           # basename (defense in depth: these came from runner.py's strict
           # validator, but the workflow re-checks before anything reaches gh).
@@ -1097,6 +1145,11 @@ jobs:
                 echo "::warning::release_assets: staged $NAME is missing or unsafe (skipped)"
                 continue
               fi
+              # An empty asset would make gh drop the whole release (#1130).
+              if [[ ! -s "$ASSET" ]]; then
+                echo "::warning::release_assets: staged $NAME is empty (skipped)"
+                continue
+              fi
               EXTRA_ASSETS+=("$ASSET")
             done
           fi
@@ -1106,23 +1159,40 @@ jobs:
           # recreate to attach the current result + extras atomically. Keep the
           # git tag (--cleanup-tag omitted) so the submission ref is unchanged.
           #
-          # But an org ruleset enforcing immutable releases (same rule noted
-          # above for post-create uploads) ALSO rejects the delete itself with
-          # HTTP 422/403 — seen live on a teacher regrade 2026-08-07: the
-          # delete failed, this step went red, and set-latest was skipped even
-          # though grading PASSED and the commit status posted success. gh's
-          # exit codes can't reliably distinguish that ruleset rejection from
-          # a transient error, so re-check existence instead: if the delete
-          # failed and the release is STILL there, treat it as
-          # immutable-blocked — warn and keep the old release rather than
-          # failing the job over record-keeping GitHub forbids. If the delete
-          # failed but the release is GONE (a race removed it), proceed to
-          # create as usual.
+          # Two ways GitHub forbids that refresh, both kept rather than failed:
+          # grading already posted its commit status, so a refresh GitHub
+          # forbids must not fail the job or lose the record.
+          #
+          # 1. The release itself is immutable (the repo/org "immutable
+          #    releases" setting). GitHub ALLOWS the delete but then refuses the
+          #    tag name forever ("tag_name was used by an immutable release"),
+          #    so deleting would erase this submission's record for good; seen
+          #    live on a regrade 2026-09-12. Check before touching it.
+          # 2. An org ruleset rejects the delete with HTTP 422/403 (seen live
+          #    2026-08-07). gh's exit codes can't reliably distinguish that from
+          #    a transient error, so re-check existence: if the release is STILL
+          #    there, treat it as immutable-blocked; if it's GONE (a race removed
+          #    it), proceed to create as usual.
+          KEPT_MSG="cannot be refreshed; the regraded score is in the commit status and the job summary, but gradebook collection keeps reading the OLD release's result.json for this submission (GitHub's rule, not ours)"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A failed probe answers "" and is treated as immutable: guessing
+            # wrong the other way destroys the record for good. The tag is a
+            # student-chosen ref name, so it is percent-encoded for the raw API
+            # path (a `#` or `%` in it would otherwise make the probe miss the
+            # release `gh release view` just found and keep it forever).
+            ENCODED_TAG="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$TAG")"
+            IMMUTABLE="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${ENCODED_TAG}" --jq '.immutable' 2>/dev/null || true)"
+            if [[ "$IMMUTABLE" == "true" ]]; then
+              echo "::warning::the release at $TAG is immutable and $KEPT_MSG"
+              exit 0
+            elif [[ "$IMMUTABLE" != "false" && "$IMMUTABLE" != "null" ]]; then
+              echo "::warning::the release at $TAG could not be checked for immutability, so it is kept as is; it $KEPT_MSG"
+              exit 0
+            fi
             if ! DELETE_ERR="$(gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes 2>&1)"; then
               if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
                 echo "$DELETE_ERR"
-                echo "::warning::the release at $TAG is immutable (org ruleset) and cannot be refreshed; the regraded score is in the commit status and the job summary, but gradebook collection keeps reading the OLD release's result.json for this submission (GitHub's rule, not ours)"
+                echo "::warning::the release at $TAG is immutable (org ruleset) and $KEPT_MSG"
                 exit 0
               fi
               # Release vanished between delete and re-check: surface why the
@@ -1138,7 +1208,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$TITLE" \
             --notes-file release-body.md \
-            --latest=false
+            --latest=true
 
       # === Ensure the Feedback PR ===
       # Opt-in per assignment (feedback-pr). One long-lived PR per repo:
@@ -1147,7 +1217,7 @@ jobs:
       # starter→latest diff with inline comments and it auto-updates on
       # every submission. Runs on always() so a failing submission still
       # gets a review surface, but only fires once there's a diff
-      # (baseline-sha != head-sha) — GitHub won't open a no-commit PR.
+      # (baseline-sha != head-sha), since GitHub won't open a no-commit PR.
       # Idempotent: reuse the one PR across submissions; reopen only a
       # student's *unmerged* close (a teacher merge means grading is
       # done). PRs opened by GITHUB_TOKEN don't retrigger workflows, so
@@ -1166,7 +1236,7 @@ jobs:
           MODE: ${{ needs.setup.outputs.mode }}
           # Honor the assignment's Feedback-PR-body template setting on the
           # fallback create path (best-effort: the Actions token may not read a
-          # private/external template — ensure_feedback_pr.py falls back then).
+          # private/external template; ensure_feedback_pr.py falls back then).
           FEEDBACK_PR_TEMPLATE: ${{ needs.setup.outputs.feedback-pr-template }}
           TEMPLATE_REPO: ${{ needs.setup.outputs.template-repo }}
           TEMPLATE_BRANCH: ${{ needs.setup.outputs.template-branch }}
@@ -1185,7 +1255,7 @@ jobs:
 
       # The script posts the classroom50/feedback-pr status itself for every
       # outcome it reaches. But if the FETCH above fails (Pages 5xx past
-      # retries), the step aborts before the script runs and posts nothing —
+      # retries), the step aborts before the script runs and posts nothing,
       # so this fallback posts an `error` status only when the step didn't
       # succeed, keeping the "agent can always poll feedback-pr" guarantee
       # (mirrors the autograde status's always() posting).
@@ -1207,46 +1277,3 @@ jobs:
             -f context="classroom50/feedback-pr" \
             -f description="Feedback PR step could not run (could not fetch ensure_feedback_pr.py from Pages)" \
             -f target_url="$RUN_URL" >/dev/null 2>&1 || true
-
-  # === Move the "latest" pointer forward ===
-  # Latest = the most recent SUBMISSION EVENT, not the newest commit:
-  # every published submission release claims the badge, so grading an
-  # older commit on purpose (a milestone tag like phase1 re-pointed at
-  # earlier work, or a teacher regrade) makes THAT release latest. This
-  # matches the gradebook collector and the web submission views, which
-  # both order by release publish time — one definition everywhere.
-  # (An earlier commit-time comparator tried "newest code wins", but it
-  # read the just-published release back as the current latest, compared
-  # it against itself, and never acted — GitHub's default publish-order
-  # badge is what actually shipped, and it is the semantics we want.)
-  # Serialized per-repo so concurrent submissions can't interleave edits.
-  set-latest:
-    needs: [setup, grade]
-    # Advance latest for any recorded submission — including the no-autograder
-    # vacuous pass (status 'success'), so its release becomes the latest the
-    # dashboard surfaces. Explicit suppressed-push / foreign-tag / shim-update
-    # guards, defensive against a future change to grade's result semantics.
-    if: >-
-      needs.setup.outputs.branch-push-suppressed != 'true' &&
-      needs.setup.outputs.foreign-tag-suppressed != 'true' &&
-      needs.setup.outputs.is-shim-update != 'true' &&
-      needs.grade.result == 'success' &&
-      (needs.grade.outputs.status == 'success' || needs.grade.outputs.status == 'failure')
-    runs-on: ubuntu-latest
-    concurrency:
-      group: classroom50-set-latest-${{ github.repository }}
-      cancel-in-progress: false
-    steps:
-      - name: Advance latest release pointer
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.setup.outputs.submission-tag }}
-        run: |
-          set -euo pipefail
-          # Best-effort: the badge is cosmetic and GitHub's own default
-          # (most recently published) already matches this rule, so a
-          # rejected edit must never fail the pipeline. Known rejection:
-          # an org ruleset enforcing immutable releases 422s any edit.
-          if ! gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest=true; then
-            echo "::warning::could not mark $TAG as the latest release (immutable-release ruleset?); GitHub's default latest (most recently published) matches anyway"
-          fi

@@ -7,20 +7,20 @@ run via the Actions rerun API: grades the SAME commit again and re-fetches the
 current autograder from Pages, so a teacher's fixed test / updated autograder
 takes effect. Because the runner stamps the submission `datetime` from the
 graded commit's committer date (not grade time), the submission time and `late`
-flag are unchanged — only the score/`graded_at` move.
+flag are unchanged; only the score/`graded_at` move.
 
 A re-run replays at ITS ORIGINAL submit/* commit, NOT the current `main` HEAD:
 regrade refreshes the score for an EXISTING submission; it does not grade newer
-un-submitted work. (Only the first-grade fallback below tags the current HEAD.)
+un-submitted work. Only a run that actually graded is replayed (see
+latest_autograde_run_id for what qualifies).
 
-A repo with a `main` HEAD but no prior autograde run (never graded) is
-first-graded by pushing a fresh `submit/<UTC-timestamp>-<short-sha>` tag, which
-fires its autograde workflow. Repos with no `main` HEAD (student hasn't
-accepted/pushed) are skipped.
+A repo with pushed work but no graded run is first-graded at the student's
+latest commit (see first_gradeable_commit and regrade_repo). Repos with nothing
+pushed since the acceptance commit (or not accepted at all) are skipped.
 
 Grading then happens ASYNCHRONOUSLY inside each student repo, so refreshed
 releases are ingested by the next `collect-scores.py` run ("Collect
-now", or a manual dispatch). Until then the gradebook shows PRE-regrade scores — an eventual-
+now", or a manual dispatch). Until then the gradebook shows PRE-regrade scores, an eventual-
 consistency window, by design (collecting here would race the still-running
 grade jobs).
 
@@ -31,28 +31,33 @@ team is the source of truth for enrollment. A single
 means the whole assignment.
 
 Environment (set by `regrade.yaml`):
-  CLASSROOM50_SERVICE_TOKEN — fine-grained PAT, Contents: Read and write AND
-                              Actions: Read and write on the student repos, plus
-                              Organization -> Members: Read to list the classroom
-                              team. Actions: write re-runs a run; Contents: write
-                              pushes a submit/* tag for the first-grade case.
-  CLASSROOM_FILTER          — classroom short-name (required for regrade).
-  ASSIGNMENT_FILTER         — assignment slug (required for regrade).
-  OWNER_FILTER              — optional single repo-owner login; empty means
-                              every rostered student for the assignment.
-  GITHUB_REPOSITORY_OWNER   — org name (auto-set by Actions).
-  GITHUB_API_URL            — API URL on GHES runners.
-  GH_API_URL                — explicit override (test servers).
+  CLASSROOM50_SERVICE_TOKEN: fine-grained PAT, Contents: Read and write AND
+                             Actions: Read and write on the student repos, plus
+                             Organization -> Members: Read to list the classroom
+                             team. Actions: write re-runs a run; Contents: write
+                             pushes a submit/* tag for the first-grade case.
+                             Workflows: Read and write is needed only to
+                             first-grade a commit pushed before a submission-mode
+                             change (GitHub's workflow-file rule; the failure
+                             names it).
+  CLASSROOM_FILTER:          classroom short-name (required for regrade).
+  ASSIGNMENT_FILTER:         assignment slug (required for regrade).
+  OWNER_FILTER:              optional single repo-owner login; empty means
+                             every rostered student for the assignment.
+  GITHUB_REPOSITORY_OWNER:   org name (auto-set by Actions).
+  GITHUB_API_URL:            API URL on GHES runners.
+  GH_API_URL:                explicit override (test servers).
 
 Exit codes:
-  0 — success (every targeted repo re-run, first-graded, or had nothing to do).
-  1 — operational failure (missing token/inputs, auth rejection, unrecoverable
-      network error). Per-repo failures warn and skip.
+  0: success (every targeted repo re-run, first-graded, or had nothing to do).
+  1: operational failure (missing token/inputs, auth rejection, unrecoverable
+     network error). Per-repo failures warn and skip.
 """
 
 from __future__ import annotations
 
 import datetime
+import functools
 import json
 import os
 import pathlib
@@ -64,7 +69,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
-# Schema sentinels — keep in lockstep with collect_scores.py and the Go
+# Schema sentinels; keep in lockstep with collect_scores.py and the Go
 # constants in cli/gh-teacher/classroom.go / assignments_json.go.
 CLASSROOM_SCHEMA_V1 = "classroom50/classroom/v1"
 ASSIGNMENTS_SCHEMA_V1 = "classroom50/assignments/v1"
@@ -73,7 +78,28 @@ ASSIGNMENTS_SCHEMA_V1 = "classroom50/assignments/v1"
 # prefix aligned with autograde-runner.yaml and collect_scores.py.
 SUBMIT_TAG_PREFIX = "submit/"
 
-# Throttle classifier constants, hand-mirrored from collect_scores.py — which
+# The accept marker both accept clients commit; the commit that adds it is the
+# acceptance commit. Mirrors contract.MetadataPath (pinned by
+# test_contract_parity.py alongside runner.py and collect_scores.py).
+ACCEPT_MARKER_PATH = ".classroom50.yaml"
+
+# GitHub fires no workflow for a push whose head commit message carries one of
+# these (tag pushes included), so a submit/* tag at such a commit grades nothing.
+# Matched case-insensitively: erring toward "won't fire" costs at most one older
+# commit graded, while the opposite error silently grades nothing.
+CI_SKIP_MARKERS = ("[skip ci]", "[ci skip]", "[no ci]", "[skip actions]", "[actions skip]")
+_SKIP_CHECKS_TRAILER = re.compile(r"^skip-checks:\s*true\s*$", re.MULTILINE)
+
+# How far back the first-grade fallback looks for a commit a tag can fire on.
+# Bookkeeping commits stack a few deep at most; one page is plenty.
+COMMIT_SCAN_PAGE_SIZE = 100
+
+# Git-data reads answer 404 for a missing repo/ref and 409 for a repo whose git
+# database is still empty (accept created it, nothing pushed yet). Both mean
+# "nothing there", not an error.
+EMPTY_OR_MISSING_GIT_DATA = (404, 409)
+
+# Throttle classifier constants, hand-mirrored from collect_scores.py, which
 # documents each one and the marker set's relationship to Go's
 # ghutil.IsRateLimited. This file shares that transport.
 RATE_LIMIT_BODY_MARKERS = (
@@ -81,6 +107,12 @@ RATE_LIMIT_BODY_MARKERS = (
     "rate limit exceeded",
     "abuse",
 )
+# Rerun-endpoint 403 bodies, lower-cased substrings. Run-side: "This workflow
+# is already running", "Unable to retry this workflow run because it was
+# created over a month ago". Token-side: "Resource not accessible by personal
+# access token" (or "by integration"), "Must have admin rights to Repository".
+RERUN_REFUSED_FOR_RUN_MARKERS = ("already running", "created over a month ago")
+RERUN_REFUSED_FOR_TOKEN_MARKERS = ("not accessible", "must have", "permission", "bad credentials")
 MAX_RETRY_SLEEP_SECONDS = 60
 TRANSIENT_RETRY_CAP_SECONDS = 30
 MAX_TOTAL_THROTTLE_SLEEP_SECONDS = 300
@@ -142,7 +174,7 @@ def _compile_tag_pattern(pattern: str) -> re.Pattern[str] | None:
         return None
 
 
-# The safe-pattern charset — literal-name characters plus the glob
+# The safe-pattern charset: literal-name characters plus the glob
 # metacharacters GitHub Actions tag filters support. Keep in lockstep with Go
 # contract.SubmissionTagCharsetRE and the web SUBMISSION_TAG_PATTERN_RE.
 _TAG_PATTERN = re.compile(r"^[A-Za-z0-9._/*?+\[\]-]+$")
@@ -150,7 +182,7 @@ _TAG_PATTERN = re.compile(r"^[A-Za-z0-9._/*?+\[\]-]+$")
 # A leading `?`/`+` (nothing to repeat) or a `+` stacked on another
 # quantifier (`v*+`, `a++`). LOAD-BEARING here in the Python mirror: those
 # translate to POSSESSIVE quantifiers, which Python 3.11+ compiles (and
-# matches!) while Go RE2 and JS reject — without this guard the four matcher
+# matches!) while Go RE2 and JS reject. Without this guard the four matcher
 # copies would diverge on exactly these patterns. Keep in lockstep with Go
 # contract.stackedQuantifierRE and the web copies.
 _STACKED_QUANTIFIER = re.compile(r"^[?+]|[*?+]\+")
@@ -159,7 +191,7 @@ _STACKED_QUANTIFIER = re.compile(r"^[?+]|[*?+]\+")
 def matches_submission_tag(patterns: list[str], tag: str) -> bool:
     """Whether `tag` matches ANY of the Actions tag-filter `patterns`; an
     empty list matches nothing. By-value copy of Go's
-    contract.MatchesSubmissionTag and the web matchesSubmissionTag — all
+    contract.MatchesSubmissionTag and the web matchesSubmissionTag, all
     pinned to identical output by the shared golden fixture
     cli/shared/testdata/submission_tag_match_cases.json. The same strings are
     rendered into the shim's on.push.tags, so this matcher and GitHub's own
@@ -183,27 +215,27 @@ def main() -> int:
     assignment_filter = (os.environ.get("ASSIGNMENT_FILTER") or "").strip()
     owner_filter = (os.environ.get("OWNER_FILTER") or "").strip()
 
-    # Regrade is always scoped to one classroom + assignment — unlike collect
+    # Regrade is always scoped to one classroom + assignment. Unlike collect
     # (which can sweep all classrooms), there's no "regrade everything" mode, so
     # both inputs are required.
     if not classroom_filter:
-        emit_error("CLASSROOM_FILTER is empty — regrade requires a classroom short-name")
+        emit_error("CLASSROOM_FILTER is empty: regrade requires a classroom short-name")
         return 1
     if not assignment_filter:
-        emit_error("ASSIGNMENT_FILTER is empty — regrade requires an assignment slug")
+        emit_error("ASSIGNMENT_FILTER is empty: regrade requires an assignment slug")
         return 1
 
     org = (os.environ.get("GITHUB_REPOSITORY_OWNER") or "").strip()
     if not org:
         emit_error(
-            "GITHUB_REPOSITORY_OWNER is empty — this script must run inside a GitHub Actions workflow"
+            "GITHUB_REPOSITORY_OWNER is empty: this script must run inside a GitHub Actions workflow"
         )
         return 1
 
     service_token = (os.environ.get("CLASSROOM50_SERVICE_TOKEN") or "").strip()
     if not service_token:
         emit_error(
-            "CLASSROOM50_SERVICE_TOKEN is empty — run `gh teacher rotate-service-token <org>` to provision it"
+            "CLASSROOM50_SERVICE_TOKEN is empty: run `gh teacher rotate-service-token <org>` to provision it"
         )
         return 1
 
@@ -219,10 +251,10 @@ def main() -> int:
     except EmptyRepoAssignment:
         # Successful no-op, not a failure: the teacher (or a stale button)
         # targeted an assignment that never autogrades (empty_repo, or a
-        # templated no_autograder with teacher-supplied CI).
+        # no_autograder without the built-in autograder).
         print(
             f"regrade {classroom_filter}/{assignment_filter}: assignment does "
-            f"not autograde (empty_repo or no_autograder) — nothing to regrade."
+            f"not autograde (empty_repo or no_autograder), so there is nothing to regrade."
         )
         return 0
     except RegradeInputError as exc:
@@ -232,7 +264,7 @@ def main() -> int:
         verdict = classify(exc)
         if verdict is THROTTLED:
             emit_error(
-                f"{classroom_filter}: could not list the classroom team — GitHub "
+                f"{classroom_filter}: could not list the classroom team. GitHub "
                 f"is throttling (HTTP {exc.code}, {rate_limit_reason(exc)}) and the "
                 f"request did not recover after retrying. The service token is fine, "
                 f"do NOT rotate it; re-run once the limit resets."
@@ -240,7 +272,7 @@ def main() -> int:
             return 1
         if verdict is FATAL:
             emit_error(
-                f"{classroom_filter}: could not list the classroom team — service token "
+                f"{classroom_filter}: could not list the classroom team: service token "
                 f"rejected or network unavailable (HTTP {exc.code} {exc.reason or 'no reason'})"
                 f"{body_note(exc)}. Ensure CLASSROOM50_SERVICE_TOKEN has Organization -> "
                 f"Members: Read with `gh teacher rotate-service-token {org}`"
@@ -254,7 +286,7 @@ def main() -> int:
     except (json.JSONDecodeError, ValueError) as exc:
         # A non-array team-listing body or the pagination page cap raises here
         # (see _paginate_login_list). Surface it as a loud error rather than an
-        # uncaught traceback — mirrors collect_scores.py's handling of the same
+        # uncaught traceback; mirrors collect_scores.py's handling of the same
         # raise.
         emit_error(
             f"{classroom_filter}: classroom team member listing malformed ({exc})"
@@ -262,12 +294,12 @@ def main() -> int:
         return 1
 
     # An empty team (enrollment flux, or a team not yet populated) means there's
-    # nothing to regrade — succeed, but warn so a green 0-repo run isn't mistaken
+    # nothing to regrade: succeed, but warn so a green 0-repo run isn't mistaken
     # for a successful regrade. Mirrors collect_scores.py's empty-team warning. A
     # single-owner regrade surfaces its own "not a member" error below instead.
     if not roster and not owner_filter:
         emit_warning(
-            f"{classroom_filter}: classroom team has no members — nothing to regrade "
+            f"{classroom_filter}: classroom team has no members, so there is nothing to regrade "
             f"for assignment {assignment_filter!r}."
         )
 
@@ -284,17 +316,17 @@ def main() -> int:
             )
             return 1
 
-    # Tag-mode assignments introduce runs that complete green but grade
-    # nothing (a suppressed stale-shim branch push); regrade_repo must skip
-    # those when picking the run to replay. Milestone submission_tags runs
-    # are real graded runs, so the patterns ride along for the run filter.
+    # Which run counts as "the latest submission" depends on the mode: in tag
+    # mode a branch push is a suppressed run, so only submission-tag runs are
+    # candidates there. Milestone submission_tags runs are real graded runs,
+    # so the patterns ride along for the run filter.
     tag_mode = is_tag_submission_mode(entry)
     submission_tags = entry.get("submission_tags") or []
     if not isinstance(submission_tags, list):
         submission_tags = []
 
-    regraded = 0   # rerun an existing run (the true regrade)
-    tagged = 0     # first-grade fallback (no prior run, tagged main HEAD)
+    regraded = 0   # re-ran an existing run (a graded run, or a suppressed run at the latest commit)
+    tagged = 0     # first-grade fallback (no graded run, tagged the latest commit)
     skipped = 0    # nothing to do (not accepted) or benign skip
     failed: list[str] = []
     total = len(targets)
@@ -308,12 +340,14 @@ def main() -> int:
             # Benign per-repo skip (e.g., the latest run can't be re-run right
             # now); already warned at the source.
             skipped += 1
-            continue
+        except _RepoFailed as exc:
+            emit_error(str(exc))
+            failed.append(repo_name)
         except urllib.error.HTTPError as exc:
             verdict = classify(exc)
             if verdict is THROTTLED:
                 emit_error(
-                    f"{org}/{repo_name}: regrade aborted — GitHub is throttling "
+                    f"{org}/{repo_name}: regrade aborted. GitHub is throttling "
                     f"(HTTP {exc.code}, {rate_limit_reason(exc)}) and the request did "
                     f"not recover after retrying. The service token is fine, do NOT "
                     f"rotate it; re-run once the limit resets."
@@ -321,10 +355,10 @@ def main() -> int:
                 return 1
             if verdict is FATAL:
                 emit_error(
-                    f"{org}/{repo_name}: regrade aborted — service token rejected or network "
+                    f"{org}/{repo_name}: regrade aborted: service token rejected or network "
                     f"unavailable (HTTP {exc.code} {exc.reason or 'no reason'}){body_note(exc)}. "
-                    f"Re-scope the PAT to Contents: Read and write AND Actions: Read and write "
-                    f"with `gh teacher rotate-service-token {org}`"
+                    f"Re-scope the PAT to Contents: Read and write, Actions: Read and write, "
+                    f"AND Workflows: Read and write with `gh teacher rotate-service-token {org}`"
                 )
                 return 1
             emit_warning(
@@ -332,25 +366,27 @@ def main() -> int:
                 f"({exc.reason or 'no reason'}); skipping"
             )
             failed.append(repo_name)
-            continue
         except (json.JSONDecodeError, ValueError) as exc:
             emit_warning(f"{org}/{repo_name}: regrade failed ({exc}); skipping")
             failed.append(repo_name)
-            continue
-
-        if outcome == "rerun":
-            regraded += 1
-        elif outcome == "tagged":
-            tagged += 1
         else:
-            # "missing": the student hasn't accepted/pushed — nothing to grade.
-            skipped += 1
+            if outcome == "rerun":
+                regraded += 1
+            elif outcome == "tagged":
+                tagged += 1
+            else:
+                # "missing": not accepted, or nothing pushed since acceptance, so
+                # there is no submission to grade. Logged per repo so a teacher
+                # who expected a grade can see why none will appear.
+                print(f"{org}/{repo_name}: no submission to grade (not accepted, or nothing pushed since accepting)")
+                skipped += 1
 
-        # Incremental progress checkpoint. The final summary below only prints
-        # if the loop completes, so a job killed by the Actions timeout (a large
-        # roster is a long sequential fan-out) would otherwise leave NO per-repo
-        # accounting. Re-dispatching is safe (rerun is idempotent and the tag
-        # path reuses an existing submit/* tag at HEAD), so a teacher can rerun.
+        # Incremental progress checkpoint, on every outcome including skips and
+        # failures. The final summary below only prints if the loop completes,
+        # so a job killed by the Actions timeout (a large roster is a long
+        # sequential fan-out) would otherwise leave NO per-repo accounting.
+        # Re-dispatching is safe (rerun is idempotent and a re-pushed tag is
+        # swallowed as already existing), so a teacher can rerun.
         if index % PROGRESS_EVERY == 0 or index == total:
             print(
                 f"regrade {classroom_filter}/{assignment_filter}: progress "
@@ -377,11 +413,55 @@ def main() -> int:
 # Per-repo regrade ------------------------------------------------------------
 
 
-# The student-repo autograde workflow filename (the shim gh-student writes at
-# accept time, `name: Autograde`). Re-running its latest run re-fetches the
-# current autograder from Pages and re-grades the same commit. Cross-binary:
-# keep aligned with cli/gh-student/embed/autograde-shim.yaml's filename.
+# The student-repo autograde workflow filename (the shim the accept clients
+# write, `name: Autograde`). Re-running its latest run re-fetches the current
+# autograder from Pages and re-grades the same commit. Cross-binary: keep
+# aligned with cli/shared/contract/autograde-shim.yaml's filename
+# (contract.AutogradeShimPath).
 AUTOGRADE_WORKFLOW = "autograde.yaml"
+AUTOGRADE_SHIM_PATH = f".github/workflows/{AUTOGRADE_WORKFLOW}"
+
+# Subject of the commit that adds the shim to a repo accepted while the
+# built-in autograder was off (`gh teacher assignment enable-autograder` / the
+# gradebook's "Add autograding workflow"). Every commit beneath it predates the
+# workflow, so no tag there can fire, and a marker it introduced is not an
+# accept (acceptance_commit_sha). Mirrors contract.ShimBackfillCommitSubject and
+# the runner.py / collect_scores.py constant of the same name; keep
+# byte-identical.
+SHIM_BACKFILL_COMMIT_SUBJECT = "[Classroom 50] Add autograde workflow (enable-autograder)"
+
+
+class _RepoLookups:
+    """One repo's GitHub reads, each fetched at most once per regrade and only
+    when a decision needs it. Every regrade_repo step shares one instance, so
+    the run list, the submit/* tag map, and the acceptance commit are never
+    fetched twice for the same repo inside a rate-limited fan-out."""
+
+    def __init__(self, api_url: str, org: str, repo: str, token: str) -> None:
+        self.api_url = api_url
+        self.org = org
+        self.repo = repo
+        self.token = token
+
+    @functools.cached_property
+    def runs(self) -> list[Any]:
+        return list_autograde_runs(self.api_url, self.org, self.repo, self.token)
+
+    @functools.cached_property
+    def tagged_shas(self) -> dict[str, str]:
+        return submit_tags_by_commit(self.api_url, self.org, self.repo, self.token)
+
+    @functools.cached_property
+    def default_branch(self) -> str | None:
+        return repo_default_branch(self.api_url, self.org, self.repo, self.token)
+
+    @functools.cached_property
+    def accept_sha(self) -> str | None:
+        if self.default_branch is None:
+            return None
+        return acceptance_commit_sha(
+            self.api_url, self.org, self.repo, self.token, self.default_branch
+        )
 
 
 def regrade_repo(
@@ -395,53 +475,173 @@ def regrade_repo(
     """Re-run grading for `repo` on its existing latest submission, without
     creating a new one. Returns one of:
 
-      "rerun"   — re-ran the latest autograde run: grades the SAME commit again
-                  (re-fetching the current autograder), and because the runner
-                  stamps `datetime` from the commit's committer date, the
-                  submission time / late flag DON'T change — only the score.
-      "tagged"  — no (usable) prior run, so a fresh submit/<ts>-<sha> tag was
-                  pushed to first-grade the main HEAD. (Submission time is
-                  still the commit's committer date; `graded_at` records the
-                  new run.)
-      "missing" — no prior run and no main HEAD (student hasn't
-                  accepted/pushed); nothing to do.
+      "rerun":   re-ran an existing run: the latest GRADED autograde run, or
+                 (first grade) a branch run the runner suppressed at the
+                 student's latest commit. Grades the SAME commit again
+                 (re-fetching the current autograder), and because the runner
+                 stamps `datetime` from the commit's committer date, the
+                 submission time / late flag DON'T change, only the score.
+      "tagged":  no graded run, so a fresh submit/<ts>-<sha> tag was pushed at
+                 the student's latest commit to first-grade it. (Submission
+                 time is still the commit's committer date; `graded_at` records
+                 the new run.)
+      "missing": nothing to grade: the student hasn't accepted, or has pushed
+                 nothing since the acceptance commit.
 
-    tag_mode narrows which run counts as "the latest submission": on a
-    tag-mode assignment a branch-triggered run is a SUPPRESSED run (a stale
-    every-push shim fired; the runner tagged and graded nothing), and
-    replaying it would re-suppress — regrade would report success while
-    grading nothing. So in tag mode only submit/* tag runs are candidates;
-    a repo with none (only suppressed pushes, or no runs at all) falls
-    through to the tag-at-HEAD path, which fires a REAL tag run (the
-    service token's tag push fires workflows). Every-push keeps today's
-    behavior exactly — its branch runs are real graded runs.
+    latest_autograde_run_id decides which run counts as graded;
+    first_gradeable_commit decides which commit a first grade targets.
 
     Raises urllib.error.HTTPError / ValueError on a hard failure the caller
     classifies (auth/network abort; other per-repo errors warn-and-skip).
     """
+    lookups = _RepoLookups(api_url, org, repo, token)
+
     # Prefer re-running the existing run: a true "regrade the same commit" with
     # no new tag and no new submission event.
     run_id = latest_autograde_run_id(
-        api_url, org, repo, token, tag_only=tag_mode, submission_tags=submission_tags
+        api_url, org, repo, token, tag_only=tag_mode, submission_tags=submission_tags,
+        lookups=lookups,
     )
     if run_id is not None:
         rerun_workflow_run(api_url, org, repo, token, run_id)
         return "rerun"
 
-    # No prior run. If the repo has a main HEAD, kick off a first grade by
-    # tagging it; otherwise there's nothing to regrade.
-    head_sha = main_head_sha(api_url, org, repo, token)
-    if head_sha is None:
+    # No graded run. Find the student's latest commit a tag push can fire on;
+    # None means nothing has been pushed since acceptance (or no repo at all).
+    found = first_gradeable_commit(api_url, org, repo, token, lookups=lookups)
+    if found is None:
         return "missing"
+    sha, branch = found
 
-    # A submit/* tag may already sit at HEAD (tagged but the run was deleted);
-    # reuse it rather than stacking a duplicate.
-    if existing_submit_tag_at(api_url, org, repo, token, head_sha) is not None:
-        return "tagged"
+    # A push suppressed under tag mode left a green no-op run at this very
+    # commit. Re-running it grades now (every-push) without a new tag and,
+    # unlike tagging, without GitHub's workflow-file rule (see below). A run
+    # still in flight is about to grade this commit itself, so the repo is
+    # skipped rather than graded twice; a completed run that can't be re-run
+    # (past GitHub's rerun window) falls through to the tag path.
+    if not tag_mode:
+        suppressed = _branch_run_at(lookups.runs, sha, branch)
+        if suppressed is not None:
+            if suppressed.get("status") != "completed":
+                emit_warning(
+                    f"{org}/{repo}: an autograde run for commit {sha[:7]} is already "
+                    f"in progress and will grade it; skipping"
+                )
+                raise _SkipRepo()
+            try:
+                rerun_workflow_run(api_url, org, repo, token, _run_id_of(suppressed))
+                return "rerun"
+            except _SkipRepo:
+                pass
 
-    tag = build_submit_tag(head_sha)
-    create_tag_ref(api_url, org, repo, token, tag, head_sha)
+    # A submit/* tag may already sit at that commit without a run that graded
+    # it: its run was deleted or expired, or the runner minted it while the
+    # assignment was in every-push mode (a tag pushed with the Actions token
+    # fires nothing, and after a switch to tag mode that branch run would
+    # re-suppress). GitHub fires nothing for a tag that already exists, so
+    # reusing it would report "first-graded" while nothing runs. Push a fresh
+    # tag instead: a second release at one commit is the lesser cost, and the
+    # newest release is the one collection reports.
+    existing = existing_submit_tag_at(api_url, org, repo, token, sha, lookups=lookups)
+    if existing is not None:
+        print(
+            f"{org}/{repo}: {existing} already points at commit {sha[:7]} but no "
+            f"autograde run graded it; pushing a fresh submit tag to grade it"
+        )
+
+    tag = build_submit_tag(sha)
+    try:
+        create_tag_ref(api_url, org, repo, token, tag, sha)
+    except urllib.error.HTTPError as exc:
+        # GitHub refuses to create a ref whose .github/workflows/* content
+        # exists on no branch unless the token holds Workflows: write (the
+        # classic `workflow` scope rule). A submission-mode retrofit rewrites
+        # the shim on the default branch, so every pre-retrofit commit trips
+        # that check, and the service token was never asked for Workflows.
+        if (
+            exc.code == 403
+            and classify(exc) is not THROTTLED
+            and shim_differs_from_default_branch(api_url, org, repo, token, sha, branch)
+        ):
+            raise _RepoFailed(
+                f"{org}/{repo}: can't start grading commit {sha[:7]}: its autograde "
+                f"workflow differs from the default branch's (the submission mode "
+                f"changed since it was pushed), and GitHub only lets a token with "
+                f"Workflows: Read and write tag such a commit. Either have the "
+                f"student push once (the push itself grades), or re-create the "
+                f"service token with Workflows: Read and write added to its usual "
+                f"permissions (`gh teacher rotate-service-token {org}`) and regrade "
+                f"again."
+            ) from exc
+        raise
     return "tagged"
+
+
+def _branch_run_at(runs: list[Any], sha: str, branch: str) -> dict | None:
+    """The newest run at commit `sha` triggered by a push to `branch`, or None.
+    Tag runs and other branches are excluded: only a default-branch push can
+    be the suppressed run worth replaying."""
+    for run in runs:
+        if not isinstance(run, dict) or run.get("head_sha") != sha:
+            continue
+        if run.get("head_branch") != branch:
+            continue
+        return run
+    return None
+
+
+class _RepoFailed(Exception):
+    """A per-repo failure with a teacher-facing explanation; counted as
+    failed (exit 1) without aborting the rest of the fan-out."""
+
+
+def shim_differs_from_default_branch(
+    api_url: str, org: str, repo: str, token: str, sha: str, branch: str
+) -> bool:
+    """Whether the autograde shim at `sha` differs from `branch`'s (the default
+    branch). Conservative: a read that fails for any reason other than a
+    throttle reports False so the caller falls back to the generic 403
+    handling; a throttle propagates so main() prints the do-not-rotate message
+    instead of blaming the token."""
+    blobs = []
+    for ref in (sha, branch):
+        url = (
+            f"{_repo_url(api_url, org, repo)}/contents/"
+            f"{urllib.parse.quote(AUTOGRADE_SHIM_PATH)}?ref={urllib.parse.quote(ref, safe='')}"
+        )
+        try:
+            body = _http_get(url, token, accept="application/vnd.github+json")
+        except urllib.error.HTTPError as exc:
+            if classify(exc) is THROTTLED:
+                raise
+            return False
+        data = json.loads(body.decode("utf-8"))
+        blob_sha = data.get("sha") if isinstance(data, dict) else None
+        if not isinstance(blob_sha, str):
+            return False
+        blobs.append(blob_sha)
+    return blobs[0] != blobs[1]
+
+
+def list_autograde_runs(api_url: str, org: str, repo: str, token: str) -> list[Any]:
+    """One newest-first page of `repo`'s autograde runs; [] when the repo or
+    workflow doesn't exist yet (404: never accepted / never ran). No pagination:
+    a graded run that scrolled past 100 skipped ones is treated as absent and
+    the caller's first-grade fallback covers it, acceptable for that degenerate
+    case."""
+    url = (
+        f"{_repo_url(api_url, org, repo)}/actions/workflows/"
+        f"{urllib.parse.quote(AUTOGRADE_WORKFLOW)}/runs?per_page=100"
+    )
+    try:
+        body = _http_get(url, token, accept="application/vnd.github+json")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return []
+        raise
+    data = json.loads(body.decode("utf-8"))
+    runs = data.get("workflow_runs") if isinstance(data, dict) else None
+    return runs if isinstance(runs, list) else []
 
 
 def latest_autograde_run_id(
@@ -452,57 +652,64 @@ def latest_autograde_run_id(
     *,
     tag_only: bool = False,
     submission_tags: list[str] | None = None,
+    lookups: _RepoLookups | None = None,
 ) -> int | None:
-    """The id of the most recent autograde run on `repo`, or None when it has
-    never run (or doesn't exist yet). Run ids are newest-first from the API, so
-    the first entry is the latest run — the one a regrade re-runs.
+    """The id of the most recent autograde run on `repo` that GRADED a
+    submission, or None. `lookups` shares the per-repo reads with the caller
+    (built here when not supplied).
 
-    tag_only=True (tag-mode assignments) considers only runs whose head_branch
-    names a real submission tag (GitHub sets head_branch to the tag on
-    tag-push runs): the canonical submit/* namespace, or a teacher-named
-    milestone pattern from `submission_tags` (a milestone run grades for real
-    — its record lives at the canonical tag the runner mints). Branch-
-    triggered runs on a tag-mode assignment are suppressed no-ops that must
-    never be replayed. One 100-run page is scanned, no pagination: if the
-    newest submission run has scrolled past 100 suppressed pushes, we return
-    None and the caller's tag-at-HEAD fallback freshly grades HEAD instead —
-    acceptable for that degenerate case.
+    Only a graded run may be replayed: the runner skips the acceptance commit,
+    a shim retrofit, and (in tag mode) a plain branch push, and a rerun of any
+    of those skips again while regrade reports success. A run graded when:
+      - GitHub set its head_branch to a real submission tag (the canonical
+        submit/* namespace, or a teacher-named milestone pattern from
+        `submission_tags`; the runner mints the canonical tag for those); or
+      - every-push mode only: a submit/* tag points at its head commit (the
+        runner mints one for every branch push it grades and none it skips),
+        or the run ended red (every skip path ends green, so a red run is one
+        that tried to grade and failed before or after minting the tag). A red
+        run at the acceptance commit or at a `[skip ci]` commit is the
+        exception: the runner's skip detection failed open that time (Pages
+        outage) and a rerun skips again, so those are passed over.
+    tag_only=True (tag-mode assignments) never replays a branch run: there a
+    branch push is a suppressed no-op even when the same commit was later
+    tagged, and its tag run is the candidate instead.
     """
-    per_page = 100 if tag_only else 1
-    url = (
-        f"{_repo_url(api_url, org, repo)}/actions/workflows/"
-        f"{urllib.parse.quote(AUTOGRADE_WORKFLOW)}/runs?per_page={per_page}"
-    )
-    try:
-        body = _http_get(url, token, accept="application/vnd.github+json")
-    except urllib.error.HTTPError as exc:
-        # 404 = repo or workflow not present yet (never accepted / never ran).
-        if exc.code == 404:
-            return None
-        raise
-    data = json.loads(body.decode("utf-8"))
-    runs = data.get("workflow_runs") if isinstance(data, dict) else None
-    if not isinstance(runs, list) or not runs:
-        return None
-    run: Any = None
-    if tag_only:
-        patterns = submission_tags or []
-        for candidate in runs:
-            if not isinstance(candidate, dict):
+    if lookups is None:
+        lookups = _RepoLookups(api_url, org, repo, token)
+    patterns = submission_tags or []
+    for candidate in lookups.runs:
+        if not isinstance(candidate, dict):
+            continue
+        head_branch = candidate.get("head_branch")
+        if isinstance(head_branch, str) and (
+            head_branch.startswith(SUBMIT_TAG_PREFIX)
+            or matches_submission_tag(patterns, head_branch)
+        ):
+            return _run_id_of(candidate)
+        if tag_only:
+            continue
+        head_sha = candidate.get("head_sha")
+        if not isinstance(head_sha, str) or not head_sha:
+            continue
+        if candidate.get("status") == "completed" and candidate.get("conclusion") not in (
+            "success",
+            "skipped",
+            None,
+        ):
+            head_commit = candidate.get("head_commit")
+            message = head_commit.get("message") if isinstance(head_commit, dict) else None
+            if isinstance(message, str) and has_ci_skip_marker(message):
                 continue
-            head_branch = candidate.get("head_branch")
-            if not isinstance(head_branch, str):
-                continue
-            if head_branch.startswith(SUBMIT_TAG_PREFIX) or matches_submission_tag(
-                patterns, head_branch
-            ):
-                run = candidate
-                break
-        if run is None:
-            return None
-    else:
-        run = runs[0]
-    run_id = run.get("id") if isinstance(run, dict) else None
+            if head_sha != lookups.accept_sha:
+                return _run_id_of(candidate)
+        if head_sha in lookups.tagged_shas:
+            return _run_id_of(candidate)
+    return None
+
+
+def _run_id_of(run: dict) -> int:
+    run_id = run.get("id")
     if not isinstance(run_id, int):
         raise ValueError("workflow run object missing an integer id")
     return run_id
@@ -514,25 +721,30 @@ def rerun_workflow_run(
     """Re-run a completed workflow run via the Actions rerun API. Replays at
     the same commit; runtime-fetched resources (runner.py and the autograder
     bundle, both from Pages at grade time) are re-fetched, so a teacher's updated
-    autograder takes effect. A 403 (not re-runnable — e.g., still in progress) is
-    surfaced as a per-repo skip by the caller, not a hard auth failure, so one
-    un-rerunnable repo doesn't abort the run."""
+    autograder takes effect."""
     url = f"{_repo_url(api_url, org, repo)}/actions/runs/{run_id}/rerun"
     try:
         _http_request("POST", url, token, body=b"{}", accept="application/vnd.github+json")
     except urllib.error.HTTPError as exc:
-        # A plain 403 here means "this run can't be re-run right now" (in
-        # progress, or too old) — a benign per-repo skip. The throttle check
-        # comes FIRST: GitHub returns a rate limit as 403 too, and swallowing
-        # that one as "not re-runnable" would exit green on an incomplete
-        # regrade while the fan-out keeps hammering an active limiter.
-        if exc.code == 403 and classify(exc) is not THROTTLED:
+        if exc.code != 403 or classify(exc) is THROTTLED:
+            raise
+        # One status, three causes; only the body tells them apart. A token that
+        # can list runs but not re-run them must not pass as a run that merely
+        # can't be re-run right now (#1051).
+        body = error_body_snippet(exc).lower()
+        if any(marker in body for marker in RERUN_REFUSED_FOR_RUN_MARKERS):
             emit_warning(
                 f"{org}/{repo}: latest autograde run {run_id} can't be re-run "
-                f"right now (in progress or expired); skipping"
+                f"right now{body_note(exc)}; skipping"
             )
             raise _SkipRepo() from exc
-        raise
+        if any(marker in body for marker in RERUN_REFUSED_FOR_TOKEN_MARKERS):
+            raise  # main() classifies it FATAL and prints the rotate-token advice
+        raise _RepoFailed(
+            f"{org}/{repo}: GitHub refused to re-run autograde run {run_id} "
+            f"(HTTP 403){body_note(exc)}. Open the run on GitHub to see why, "
+            f"then regrade again."
+        ) from exc
 
 
 class _SkipRepo(Exception):
@@ -550,7 +762,7 @@ def build_submit_tag(sha: str) -> str:
 
 def repo_default_branch(api_url: str, org: str, repo: str, token: str) -> str | None:
     """The repo's default branch (which GitHub may have named `master`), or None
-    when the repo doesn't exist (404) — the student hasn't accepted."""
+    when the repo doesn't exist (404), meaning the student hasn't accepted."""
     try:
         body = _http_get(
             _repo_url(api_url, org, repo), token, accept="application/vnd.github+json"
@@ -566,45 +778,150 @@ def repo_default_branch(api_url: str, org: str, repo: str, token: str) -> str | 
     return SUBMISSION_BRANCH
 
 
-def main_head_sha(api_url: str, org: str, repo: str, token: str) -> str | None:
-    """The commit SHA at `repo`'s default-branch HEAD, or None when the repo
-    or branch doesn't exist (404) — the student hasn't accepted/pushed.
+def first_gradeable_commit(
+    api_url: str, org: str, repo: str, token: str, *, lookups: _RepoLookups | None = None
+) -> tuple[str, str] | None:
+    """(sha, default branch) of the newest default-branch commit a submit/* tag
+    push can fire on, or None when there is nothing to first-grade: the repo
+    doesn't exist (student hasn't accepted), or nothing was pushed since the
+    acceptance commit.
 
-    Resolves the repo's actual default branch first (it may be `master`), so a
-    non-main repo is regraded off its real HEAD rather than a nonexistent
-    `main`."""
-    branch = repo_default_branch(api_url, org, repo, token)
+    Walks the branch newest-first, skipping commits whose message carries a CI
+    skip marker: GitHub fires no workflow for a tag whose commit says
+    `[skip ci]`, so tagging one would report "first-graded" while nothing runs.
+    The tool's own bookkeeping commits (submission-mode shim retrofit, Feedback
+    PR open) are exactly such commits and touch no student work, so the commit
+    under them is the same submission. The walk stops at the acceptance commit
+    (the one that added .classroom50.yaml): a student who accepted but never
+    pushed has no submission, and grading the starter code would publish a
+    zero-score release the roster reads as "submitted".
+
+    Raises _RepoFailed on reaching the shim backfill commit: the commits under
+    it have no autograde workflow at all, so a tag at any of them fires nothing
+    and the student's next push is the only way to grade that work."""
+    if lookups is None:
+        lookups = _RepoLookups(api_url, org, repo, token)
+    branch = lookups.default_branch
     if branch is None:
         return None
-    url = f"{_repo_url(api_url, org, repo)}/git/ref/heads/{urllib.parse.quote(branch)}"
+    for commit in list_branch_commits(api_url, org, repo, token, branch):
+        sha = commit.get("sha") if isinstance(commit, dict) else None
+        if not isinstance(sha, str) or not sha:
+            continue
+        if sha == lookups.accept_sha:
+            return None
+        meta = commit.get("commit")
+        message = meta.get("message") if isinstance(meta, dict) else None
+        if isinstance(message, str) and is_shim_backfill_commit(message):
+            raise _RepoFailed(
+                f"{org}/{repo}: can't grade the work pushed before commit {sha[:7]}: "
+                f"the autograde workflow was added to this repository after it "
+                f"(the built-in autograder was turned on later), so a tag at an "
+                f"earlier commit starts no run. Grading starts on the student's "
+                f"next push. To grade now, have the student push once: "
+                f"`git commit --allow-empty -m \"Grade\" && git push`."
+            )
+        if isinstance(message, str) and has_ci_skip_marker(message):
+            continue
+        return sha, branch
+    return None
+
+
+def _commit_subject(message: str) -> str:
+    """A commit message's first line, trimmed (mirrors collect_scores.py)."""
+    newline = message.find("\n")
+    return (message if newline == -1 else message[:newline]).strip()
+
+
+def is_shim_backfill_commit(message: str) -> bool:
+    """Whether a commit is the enable-autograder backfill's: subject compared
+    exactly after trimming, body ignored. Mirrors collect_scores.py and
+    contract.IsShimBackfillCommit; pinned by baseline_source_cases.json."""
+    return _commit_subject(message) == SHIM_BACKFILL_COMMIT_SUBJECT
+
+
+def has_ci_skip_marker(message: str) -> bool:
+    """Whether GitHub would skip workflows for a push headed by this commit."""
+    lowered = message.lower()
+    if any(marker in lowered for marker in CI_SKIP_MARKERS):
+        return True
+    return _SKIP_CHECKS_TRAILER.search(lowered) is not None
+
+
+def list_branch_commits(
+    api_url: str, org: str, repo: str, token: str, branch: str, *, path: str | None = None
+) -> list[Any]:
+    """One newest-first page of `branch`'s commits (optionally only those
+    touching `path`); [] when the repo or branch doesn't exist (404) or the
+    repo's git database is still empty (409)."""
+    query = {"sha": branch, "per_page": str(COMMIT_SCAN_PAGE_SIZE)}
+    if path is not None:
+        query["path"] = path
+    url = f"{_repo_url(api_url, org, repo)}/commits?{urllib.parse.urlencode(query)}"
     try:
         body = _http_get(url, token, accept="application/vnd.github+json")
     except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
+        if exc.code in EMPTY_OR_MISSING_GIT_DATA:
+            return []
         raise
-    ref = json.loads(body.decode("utf-8"))
-    obj = ref.get("object") if isinstance(ref, dict) else None
-    sha = obj.get("sha") if isinstance(obj, dict) else None
-    if not isinstance(sha, str) or not sha:
-        raise ValueError(f"git/ref/heads/{branch} returned no object.sha")
-    return sha
+    commits = json.loads(body.decode("utf-8"))
+    if not isinstance(commits, list):
+        raise ValueError("repos/.../commits did not return an array")
+    return commits
+
+
+def acceptance_commit_sha(
+    api_url: str, org: str, repo: str, token: str, branch: str
+) -> str | None:
+    """The acceptance commit: the oldest commit on `branch` touching the accept
+    marker (nothing touches it before accept creates it). None when the marker
+    has no history on the branch, so the caller doesn't stop the walk. Also
+    None when the enable-autograder backfill introduced the marker: that repo
+    was accepted without one (no_autograder), so the backfill is not an accept
+    sentinel; the walk in first_gradeable_commit must reach it and fail red
+    instead of reporting "no submission". Mirrors collect_scores.marker_baseline.
+    One page deep: more than 100 marker rewrites on one repo is out of scope."""
+    commits = list_branch_commits(api_url, org, repo, token, branch, path=ACCEPT_MARKER_PATH)
+    for commit in reversed(commits):
+        sha = commit.get("sha") if isinstance(commit, dict) else None
+        if not isinstance(sha, str) or not sha:
+            continue
+        meta = commit.get("commit")
+        message = meta.get("message") if isinstance(meta, dict) else None
+        if isinstance(message, str) and is_shim_backfill_commit(message):
+            return None
+        return sha
+    return None
 
 
 def existing_submit_tag_at(
-    api_url: str, org: str, repo: str, token: str, sha: str
+    api_url: str,
+    org: str,
+    repo: str,
+    token: str,
+    sha: str,
+    *,
+    lookups: _RepoLookups | None = None,
 ) -> str | None:
-    """Return a submit/* tag name already pointing at `sha`, or None.
+    """Return a submit/* tag name already pointing at `sha`, or None."""
+    if lookups is None:
+        lookups = _RepoLookups(api_url, org, repo, token)
+    return lookups.tagged_shas.get(sha)
 
-    Lists the repo's submit/* tag refs and matches on the pointed-at commit. A
+
+def submit_tags_by_commit(api_url: str, org: str, repo: str, token: str) -> dict[str, str]:
+    """The repo's submit/* tags keyed by the commit they point at (the first
+    tag seen wins when several sit on one commit); {} when the repo has none.
+
+    Lists the repo's submit/* tag refs and resolves each to a commit. A
     lightweight tag's ref points straight at the commit (object.type ==
     "commit"); an ANNOTATED tag's ref points at a tag object (object.type ==
-    "tag"), so its object.sha is the tag's own sha — that case is dereferenced
-    via git/tags/<sha> to recover the target commit before comparing. Resolving
-    both keeps the first-grade fallback idempotent even when a prior submit tag
-    was annotated (autograde-runner.yaml's set-latest step shows annotated
-    submit tags occur), so a regrade reuses the existing tag instead of minting
-    a duplicate that yields two releases for one commit."""
+    "tag"), so its object.sha is the tag's own sha; that case is dereferenced
+    via git/tags/<sha> to recover the target commit. Resolving both keeps the
+    first-grade fallback idempotent even when a prior submit tag was annotated
+    (autograde-runner.yaml's tag step filters peeled refs because annotated
+    submit tags occur), so a regrade reuses the existing tag instead of
+    minting a duplicate that yields two releases for one commit."""
     url = (
         f"{_repo_url(api_url, org, repo)}/git/matching-refs/"
         f"tags/{urllib.parse.quote(SUBMIT_TAG_PREFIX, safe='')}"
@@ -612,12 +929,13 @@ def existing_submit_tag_at(
     try:
         body = _http_get(url, token, accept="application/vnd.github+json")
     except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
+        if exc.code in EMPTY_OR_MISSING_GIT_DATA:
+            return {}
         raise
     refs = json.loads(body.decode("utf-8"))
     if not isinstance(refs, list):
         raise ValueError("git/matching-refs/tags did not return an array")
+    by_commit: dict[str, str] = {}
     for ref in refs:
         if not isinstance(ref, dict):
             continue
@@ -629,50 +947,43 @@ def existing_submit_tag_at(
             and ref_name.startswith(f"refs/tags/{SUBMIT_TAG_PREFIX}")
         ):
             continue
-        if _ref_points_at_commit(api_url, org, repo, token, obj, sha):
-            return ref_name[len("refs/tags/") :]
-    return None
+        commit_sha = _ref_commit_sha(api_url, org, repo, token, obj)
+        if commit_sha is not None:
+            by_commit.setdefault(commit_sha, ref_name[len("refs/tags/") :])
+    return by_commit
 
 
-def _ref_points_at_commit(
-    api_url: str, org: str, repo: str, token: str, obj: dict, sha: str
-) -> bool:
-    """Whether a tag ref's `object` ultimately points at commit `sha`.
+def _ref_commit_sha(api_url: str, org: str, repo: str, token: str, obj: dict) -> str | None:
+    """The commit a tag ref's `object` ultimately points at, or None.
 
     A lightweight tag's object IS the commit (type == "commit"); an annotated
     tag's object is a tag object (type == "tag") whose git/tags/<sha>
-    target.object.sha is the commit. A failed dereference is treated
-    conservatively as a non-match (worst case: a duplicate release, never a
-    missed regrade)."""
+    target.object.sha is the commit. A failed dereference resolves to None
+    (worst case: a duplicate release, never a missed regrade)."""
     obj_sha = obj.get("sha")
     if not isinstance(obj_sha, str) or not obj_sha:
-        return False
-    if obj_sha == sha:
-        return True
-    # Annotated tag: the ref points at a tag object, so dereference it to the
-    # commit it wraps. Lightweight tags (type "commit") already matched/failed
-    # above, so only chase the tag-object case.
+        return None
     if obj.get("type") != "tag":
-        return False
+        return obj_sha
     tag_url = f"{_repo_url(api_url, org, repo)}/git/tags/{urllib.parse.quote(obj_sha, safe='')}"
     try:
         body = _http_get(tag_url, token, accept="application/vnd.github+json")
     except urllib.error.HTTPError:
-        return False
+        return None
     try:
         tag_obj = json.loads(body.decode("utf-8"))
     except (json.JSONDecodeError, ValueError):
-        return False
+        return None
     target = tag_obj.get("object") if isinstance(tag_obj, dict) else None
     target_sha = target.get("sha") if isinstance(target, dict) else None
-    return isinstance(target_sha, str) and target_sha == sha
+    return target_sha if isinstance(target_sha, str) and target_sha else None
 
 
 def create_tag_ref(
     api_url: str, org: str, repo: str, token: str, tag: str, sha: str
 ) -> None:
     """Create a lightweight tag ref `refs/tags/<tag>` at `sha`. A 422 whose body
-    says the ref already exists is benign — a concurrent regrade won the race —
+    says the ref already exists is benign (a concurrent regrade won the race),
     so it's swallowed; any OTHER 422 (invalid sha, unprocessable payload) is a
     real failure and propagates, so the caller records it as failed rather than
     mis-counting the repo as first-graded."""
@@ -681,7 +992,7 @@ def create_tag_ref(
     try:
         _http_request("POST", url, token, body=payload, accept="application/vnd.github+json")
     except urllib.error.HTTPError as exc:
-        # Only swallow the "reference already exists" 422 — GitHub returns that
+        # Only swallow the "reference already exists" 422, which GitHub returns
         # for a duplicate ref. Any other 422 (invalid sha, malformed ref) must
         # NOT count as a successful tagging, so re-raise for warn-and-skip.
         if exc.code == 422 and _http_error_says_ref_exists(exc):
@@ -698,13 +1009,13 @@ def _http_error_says_ref_exists(exc: urllib.error.HTTPError) -> bool:
     GitHub's git/refs endpoint returns `{"message": "Reference already
     exists", ...}` for a duplicate ref. Match on that phrase
     (case-insensitively) so a genuinely different 422 isn't mistaken for the
-    benign race. An unreadable body falls back to False (treat as a real error)
-    — failing safe toward surfacing the failure.
+    benign race. An unreadable body falls back to False (treat as a real error),
+    failing safe toward surfacing the failure.
 
     Reads through error_body_snippet rather than exc.read(): the body is a
     one-shot stream, so a second reader would get b"" and silently lose this
     detection. That widens the match from the `message` field to the whole
-    300-char body — deliberate: a duplicate-ref 422 says "already exists"
+    300-char body, deliberately: a duplicate-ref 422 says "already exists"
     nowhere else, and matching the field alone would miss GitHub's other
     phrasings of the same race."""
     return "already exists" in error_body_snippet(exc).lower()
@@ -718,8 +1029,8 @@ class RegradeInputError(Exception):
 
 
 class EmptyRepoAssignment(Exception):
-    """The target assignment never autogrades — empty_repo: true (bare repos)
-    or no_autograder: true (templated, teacher-supplied CI). Student repos carry
+    """The target assignment never autogrades: empty_repo: true (bare repos)
+    or no_autograder: true (no built-in autograder). Student repos carry
     no autograde workflow, so there is nothing to re-run and no HEAD worth
     tagging (the first-grade fallback would push submit/* tags that fire
     nothing). main() treats this as a successful no-op, not an error."""
@@ -736,8 +1047,8 @@ def is_empty_repo(entry: dict[str, Any]) -> bool:
 
 def is_no_autograder(entry: dict[str, Any]) -> bool:
     """True only when no_autograder is the boolean `true` (strict, like
-    is_empty_repo). A templated no_autograder assignment commits no shim, so it
-    never autogrades and produces no submit/* releases — regrade has nothing to
+    is_empty_repo). A no_autograder assignment commits no shim, so it
+    never autogrades and produces no submit/* releases, so regrade has nothing to
     re-run and no HEAD worth tagging. Keep byte-identical to collect_scores.py /
     the autograde-runner so every tool agrees."""
     return entry.get("no_autograder") is True
@@ -746,17 +1057,17 @@ def is_no_autograder(entry: dict[str, Any]) -> bool:
 def is_init_shim(entry: dict[str, Any]) -> bool:
     """True only when init_shim is the boolean `true` (strict, like
     is_empty_repo). An init_shim assignment initializes a template-less repo
-    with only the marker + default shim — it DOES autograde, so unlike
+    with only the marker + default shim. It DOES autograde, so unlike
     empty_repo/no_autograder it is NOT part of skips_grading(): regrade treats
     it as a normal grading assignment. Keep byte-identical to collect_scores.py."""
     return entry.get("init_shim") is True
 
 
 def skips_grading(entry: dict[str, Any]) -> bool:
-    """True when the assignment never autogrades — either a bare empty_repo or a
-    templated no_autograder (teacher-supplied CI). The "does not autograde"
+    """True when the assignment never autogrades: either a bare empty_repo or a
+    no_autograder (no built-in autograder). The "does not autograde"
     predicate family shared with collect_scores.py. NOTE: init_shim is
-    deliberately EXCLUDED — it commits the default shim and autogrades."""
+    deliberately EXCLUDED; it commits the default shim and autogrades."""
     return is_empty_repo(entry) or is_no_autograder(entry)
 
 
@@ -780,9 +1091,9 @@ def load_roster(
 
     Validates the assignments.json schema and that the target slug is
     registered (so a typo'd slug fails loudly rather than tagging nothing), then
-    enumerates the classroom GitHub team — the source of truth for enrollment.
+    enumerates the classroom GitHub team, the source of truth for enrollment.
     The entry rides along so main() can read submission_mode (regrade must not
-    replay a suppressed tag-mode branch run — see regrade_repo). Config
+    replay a suppressed tag-mode branch run; see regrade_repo). Config
     problems raise RegradeInputError; a team-listing HTTP error propagates so
     main() can classify it (hard auth/network vs. transient).
     """
@@ -813,9 +1124,9 @@ def load_roster(
             f"assignment {assignment_slug!r} is not registered in "
             f"{classroom_dir.name}/assignments.json"
         )
-    # Assignments that never autograde (empty_repo, or a templated
-    # no_autograder with teacher-supplied CI) commit no autograde workflow, so
-    # skip before the team listing — otherwise the first-grade fallback would
+    # Assignments that never autograde (empty_repo, or a
+    # no_autograder without the built-in autograder) commit no autograde workflow, so
+    # skip before the team listing; otherwise the first-grade fallback would
     # push useless submit/* tags into every student repo.
     if skips_grading(entries[assignment_slug]):
         raise EmptyRepoAssignment(assignment_slug)
@@ -859,7 +1170,7 @@ def load_roster(
 
 def resolve_team_slug(classroom_meta: dict[str, Any], classroom_short: str) -> str:
     """The classroom's GitHub team slug: persisted classroom.json `team.slug`
-    when present (authoritative — GitHub may re-slug on a name collision, e.g.
+    when present (authoritative, since GitHub may re-slug on a name collision, e.g.
     `classroom50-cs-1`), else the derived `classroom50-<short>`. Mirrors
     collect_scores.py's resolve_team_slug and the web/Go resolvers so all target
     the same team."""
@@ -1113,7 +1424,7 @@ def error_body_snippet(exc: urllib.error.HTTPError) -> str:
 def body_note(exc: urllib.error.HTTPError) -> str:
     """error_body_snippet formatted for appending to a log line."""
     snippet = error_body_snippet(exc)
-    return f" — response: {snippet}" if snippet else ""
+    return f", response: {snippet}" if snippet else ""
 
 
 def rate_limit_verdict(
@@ -1136,7 +1447,7 @@ def rate_limit_verdict(
             min(int(retry_after), MAX_RETRY_SLEEP_SECONDS),
         )
     if (headers.get("X-RateLimit-Remaining") or "").strip() == "0":
-        # The primary hourly budget: not waited out — its window runs up to an
+        # The primary hourly budget: not waited out, because its window runs up to an
         # hour, so a named error beats a sleeping job.
         reset = (headers.get("X-RateLimit-Reset") or "").strip()
         window = f", resets at {epoch_to_iso(reset)}" if reset.isdigit() else ""
@@ -1209,11 +1520,11 @@ def classify(exc: urllib.error.HTTPError) -> str:
     """The ONE verdict every error handler branches on. Mirrors
     collect_scores.py.
 
-    THROTTLED — GitHub is rate limiting; the token is healthy and the work is
+    THROTTLED: GitHub is rate limiting; the token is healthy and the work is
         deferrable.
-    FATAL     — 401/403 (bad or under-scoped token) or 599 (synthetic
+    FATAL:     401/403 (bad or under-scoped token) or 599 (synthetic
         network-unavailable after retries). Aborts the run.
-    SKIPPABLE — everything else; a per-repo 404/422 warns and skips.
+    SKIPPABLE: everything else; a per-repo 404/422 warns and skips.
 
     The throttle is checked FIRST (see rate_limit_verdict)."""
     if rate_limit_verdict(exc) is not None:
