@@ -110,6 +110,31 @@
       "grading": {
         "mode": "off"
       }
+    },
+    {
+      "slug": "olne",
+      "name": "Open-loop Nash equilibria in non-LQ games",
+      "mode": "individual",
+      "autograder": "default",
+      "feedback_pr": true,
+      "no_autograder": true,
+      "copy_about": true,
+      "copy_topics": true,
+      "template": {
+        "owner": "utaustin-ase-389",
+        "repo": "Assignment5",
+        "branch": "main"
+      },
+      "due": "2026-11-10T05:59:00Z",
+      "due_meta": {
+        "input": "2026-11-09T23:59:00",
+        "zone": "America/Chicago",
+        "offset": "-06:00",
+        "source": "auto-detected"
+      },
+      "grading": {
+        "mode": "off"
+      }
     }
   ]
 }
